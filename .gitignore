@@ -1,0 +1,10 @@
+data/
+*.mp4
+*.zip
+*.csv
+outputs/
+.ipynb_checkpoints/
+__pycache__/
+*.pyc
+checkpoints/
+*.pth
