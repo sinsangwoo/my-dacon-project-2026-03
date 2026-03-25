@@ -1,11 +1,12 @@
 """
-Dacon 구조 안정성 분류 - 앙상블 예측 스크립트 (v5)
-=====================================================
-5개 Fold Best Model 을 Soft-Voting 으로 앙상블 + TTA 적용.
+Dacon 구조 안정성 — 앙상블 예측 스크립트 (v6)
+================================================
+best_fold{k}.pth (best-ECE) + best_fold{k}_swa.pth (SWA)
+두 버전을 Rank Averaging 으로 앙상블. TTA 선택 가능.
 
 사용법:
     python src/predict.py --data_dir data --n_folds 5
-    python src/predict.py --tta_steps 3   # 원본 + H-Flip + ColorJitter
+    python src/predict.py --tta_steps 3 --use_swa
 """
 
 import argparse
@@ -23,7 +24,7 @@ warnings.filterwarnings("ignore", category=UserWarning)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.dataset import StructuralDataset, get_val_transform
-from src.model import TripleStreamConvNeXt
+from src.model import TripleStreamEfficientNet
 
 
 def parse_args():
@@ -31,55 +32,84 @@ def parse_args():
     p.add_argument("--data_dir",   default="data")
     p.add_argument("--save_dir",   default="checkpoints")
     p.add_argument("--output_csv", default="submission.csv")
-    p.add_argument("--img_size",   type=int, default=268)
+    p.add_argument("--img_size",   type=int, default=240)
     p.add_argument("--batch_size", type=int, default=16)
     p.add_argument("--n_folds",    type=int, default=5)
     p.add_argument("--tta_steps",  type=int, default=3,
-                   help="TTA 변환 수 (1=원본만, 3=원본+HFlip+ColorJitter)")
+                   help="TTA 수 (1=원본, 3=원본+HFlip+ColorJitter)")
+    p.add_argument("--use_swa",    action="store_true", default=True,
+                   help="SWA 모델도 앙상블에 포함 (기본: True)")
     return p.parse_args()
 
 
-def build_tta_transforms(img_size, n_steps):
+def build_tta_transforms(img_size, n):
     base = get_val_transform(img_size)
     tfs  = [base]
-    if n_steps >= 2:
+    if n >= 2:
         tfs.append(transforms.Compose([
-            transforms.RandomHorizontalFlip(p=1.0),
-            base,
+            transforms.RandomHorizontalFlip(p=1.0), base
         ]))
-    if n_steps >= 3:
+    if n >= 3:
         tfs.append(transforms.Compose([
-            transforms.ColorJitter(brightness=0.1, contrast=0.1),
-            base,
+            transforms.ColorJitter(brightness=0.1, contrast=0.1), base
         ]))
     return tfs
 
 
-def predict_with_model(model, dataset, batch_size, device, tta_transforms):
-    """단일 모델 + TTA 예측 → (ids, probs(N,2))"""
-    all_ids     = None
-    sum_probs   = None
+def load_model(ckpt_path, device):
+    ckpt  = torch.load(ckpt_path, map_location=device, weights_only=False)
+    sa    = ckpt.get("args", {})
+    model = TripleStreamEfficientNet(
+        num_classes=2,
+        pretrained=False,
+        dropout=sa.get("dropout", 0.4),
+        stoch_depth_p=0.0,   # 추론 시 SD 비활성
+    ).to(device)
+    model.load_state_dict(ckpt["model_state_dict"])
+    model.eval()
+    temperature = ckpt.get("temperature", 1.0)
+    return model, temperature, ckpt.get("epoch", "?"), ckpt.get("dev_ece", float("nan"))
 
-    for t_idx, tf in enumerate(tta_transforms):
+
+@torch.no_grad()
+def predict_with_model(model, dataset, batch_size, device, tta_tfs, temperature=1.0):
+    """단일 모델 + TTA 예측 → (ids, probs(N,2))"""
+    sum_probs = None
+    all_ids   = None
+
+    for t_idx, tf in enumerate(tta_tfs):
         dataset.transform = tf
         loader = DataLoader(dataset, batch_size=batch_size,
                             shuffle=False, num_workers=0)
-        step_ids, step_probs = [], []
-        with torch.no_grad():
-            for front, top, diff, ids in loader:
-                out   = model(front.to(device), top.to(device), diff.to(device))
-                probs = torch.softmax(out, dim=1).cpu().numpy()
-                step_probs.append(probs)
-                if t_idx == 0:
-                    step_ids.extend(ids)
-        step_probs = np.concatenate(step_probs, axis=0)
+        step_probs, step_ids = [], []
+        for front, top, diff, ids in loader:
+            logits = model(
+                front.to(device), top.to(device), diff.to(device)
+            ) / max(temperature, 0.1)   # Temperature Scaling 적용
+            probs = torch.softmax(logits, dim=1).cpu().numpy()
+            step_probs.append(probs)
+            if t_idx == 0:
+                step_ids.extend(ids)
+
+        sp = np.concatenate(step_probs, axis=0)
         if sum_probs is None:
-            sum_probs = step_probs
+            sum_probs = sp
             all_ids   = step_ids
         else:
-            sum_probs += step_probs
+            sum_probs += sp
 
-    return all_ids, sum_probs / len(tta_transforms)
+    return all_ids, sum_probs / len(tta_tfs)
+
+
+def rank_avg(probs_list):
+    """Rank Averaging — 확률을 순위로 변환 후 평균 → LogLoss 폭탄 방어."""
+    N        = probs_list[0].shape[0]
+    rank_sum = np.zeros(N)
+    for probs in probs_list:
+        order     = np.argsort(np.argsort(probs[:, 1]))
+        rank_sum += (order + 1)
+    norm = rank_sum / len(probs_list) / N
+    return np.stack([1 - norm, norm], axis=1)
 
 
 def main():
@@ -96,43 +126,44 @@ def main():
         transform=val_tf, img_size=args.img_size,
     )
 
-    ensemble_probs = None
+    all_probs_list = []
     final_ids      = None
-    loaded_folds   = 0
 
     for fold_idx in range(1, args.n_folds + 1):
+        # ── best-ECE 버전 ──
         ckpt_path = os.path.join(args.save_dir, f"best_fold{fold_idx}.pth")
-        if not os.path.exists(ckpt_path):
-            print(f"  ⚠️  {ckpt_path} 없음, 건너뜀")
-            continue
-
-        ckpt       = torch.load(ckpt_path, map_location=device, weights_only=False)
-        saved_args = ckpt.get("args", {})
-        model      = TripleStreamConvNeXt(
-            num_classes=2, pretrained=False,
-            dropout=saved_args.get("dropout", 0.3),
-        ).to(device)
-        model.load_state_dict(ckpt["model_state_dict"])
-        model.eval()
-        print(f"  ✅ Fold {fold_idx} loaded "
-              f"(epoch={ckpt['epoch']}, Loss={ckpt.get('dev_loss',0):.4f}, "
-              f"AUC={ckpt.get('dev_auc',0):.4f})")
-
-        ids, probs = predict_with_model(
-            model, test_dataset, args.batch_size, device, tta_tfs)
-
-        if ensemble_probs is None:
-            ensemble_probs = probs
-            final_ids      = ids
+        if os.path.exists(ckpt_path):
+            model, T, ep, ece = load_model(ckpt_path, device)
+            print(f"  ✅ Fold {fold_idx}  epoch={ep}  ECE={ece:.4f}  T={T:.3f}")
+            ids, probs = predict_with_model(
+                model, test_dataset, args.batch_size,
+                device, tta_tfs, temperature=T
+            )
+            all_probs_list.append(probs)
+            if final_ids is None:
+                final_ids = ids
         else:
-            ensemble_probs += probs
-        loaded_folds += 1
+            print(f"  ⚠️  {ckpt_path} 없음, 건너뜀")
 
-    if loaded_folds == 0:
+        # ── SWA 버전 ──
+        if args.use_swa:
+            swa_path = os.path.join(
+                args.save_dir, f"best_fold{fold_idx}_swa.pth"
+            )
+            if os.path.exists(swa_path):
+                model_s, T_s, _, ece_s = load_model(swa_path, device)
+                print(f"  📦 Fold {fold_idx} SWA  ECE={ece_s:.4f}")
+                _, probs_s = predict_with_model(
+                    model_s, test_dataset, args.batch_size,
+                    device, tta_tfs, temperature=T_s
+                )
+                all_probs_list.append(probs_s)
+
+    if not all_probs_list:
         raise RuntimeError("유효한 checkpoint 가 없습니다. train.py 를 먼저 실행하세요.")
 
-    ensemble_probs /= loaded_folds
-    print(f"\n🗳️  Ensemble from {loaded_folds} fold(s)")
+    print(f"\n🗳️  Rank Averaging {len(all_probs_list)} predictions...")
+    ensemble_probs = rank_avg(all_probs_list)
 
     submission = pd.DataFrame({
         "id":            final_ids,
@@ -146,12 +177,7 @@ def main():
     print(f"   Avg unstable_prob : {u.mean():.4f}")
     print(f"   Unstable (≥0.5)   : {(u >= 0.5).sum()}")
     print(f"   Stable   (<0.5)   : {(u < 0.5).sum()}")
-
-    # 검증
-    sums     = ensemble_probs.sum(axis=1)
-    in_range = (u.min() >= 0.0) and (u.max() <= 1.0)
-    print(f"   Sum==1.0          : {np.allclose(sums, 1.0)}")
-    print(f"   In [0,1]          : {in_range}")
+    print(f"   Sum==1.0          : {np.allclose(ensemble_probs.sum(1), 1.0)}")
     print("✨ Done!")
 
 
