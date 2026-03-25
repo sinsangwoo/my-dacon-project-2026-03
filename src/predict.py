@@ -28,7 +28,7 @@ def main():
 
     # 체크포인트 로드
     print(f"📦 Loading checkpoint: {ckpt_path}")
-    ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     saved_args = ckpt.get("args", {})
     best_metric_str = f"Dev Loss: {ckpt.get('dev_loss', 'N/A'):.4f}" if 'dev_loss' in ckpt else f"Dev AUC: {ckpt.get('dev_auc', 'N/A'):.4f}"
     print(f"   Saved at epoch {ckpt['epoch']} with {best_metric_str}")
