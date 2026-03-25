@@ -1,373 +1,299 @@
 """
-Dacon 구조 안정성 분류 - 학습 스크립트 (Physical Intelligence v4)
-==================================================================
-주요 변경점 (v4):
-  - PhysicsConsistencyLoss를 훈련 Loss에 직접 반영 (--pcs_lambda)
-  - 버그 수정: dev_probs 루프에서 model(front, top, diff) 3인자 호출
-  - Best 모델 저장 기준: dev_loss - pcs_bonus 복합 점수
-  - 로그 출력에 PCS Reg Loss 항목 추가
-
+Dacon 구조 안정성 분류 - 학습 스크립트 (v5: 5-Fold CV)
+==========================================================
 사용법:
-    python src/train.py --data_dir data --epochs 30 --batch_size 16 --lr 3e-4
-    python src/train.py --pcs_lambda 0.2   # PCS 정규화 가중치 강화
-    python src/train.py --merge_dev        # Train+Dev 합쳐서 학습
-    python src/train.py --use_pseudo       # Pseudo-Label까지 포함
+    # 기본 5-Fold 학습
+    python src/train.py --data_dir data --epochs 30 --batch_size 16
+
+    # Pseudo v2 병합
+    python src/train.py --use_pseudo_v2
+
+    # PCS 정규화 강화
+    python src/train.py --pcs_lambda 0.15
 """
 
 import argparse
 import os
 import sys
-import warnings
 import time
+import warnings
 
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
 from sklearn.metrics import roc_auc_score
+from sklearn.model_selection import StratifiedKFold
 from torch.utils.data import DataLoader
 
 warnings.filterwarnings("ignore", category=UserWarning)
-
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from src.dataset import StructuralDataset, get_train_transform, get_val_transform
-from src.model import TripleStreamConvNeXt, FocalLoss, PhysicsConsistencyLoss, count_parameters
+from src.dataset import (
+    KFoldStructuralDataset,
+    build_full_df,
+    load_pseudo_v2,
+    get_train_transform,
+    get_val_transform,
+)
+from src.model import (
+    TripleStreamConvNeXt,
+    FocalLoss,
+    PhysicsConsistencyLoss,
+    compute_ece,
+    compute_gradcam_consistency,
+    count_parameters,
+)
 
+
+# ──────────────────────────────────────────────────────────────────
+#  Args
+# ──────────────────────────────────────────────────────────────────
 
 def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Structural Stability Classification - Triple-Stream + PCS Training",
-    )
+    p = argparse.ArgumentParser()
     # 데이터
-    parser.add_argument("--data_dir",    type=str,   default="data")
-    parser.add_argument("--img_size",    type=int,   default=224)
-    parser.add_argument("--num_workers", type=int,   default=0)
+    p.add_argument("--data_dir",    default="data")
+    p.add_argument("--img_size",    type=int,   default=268,
+                   help="입력 해상도 (224*1.2=268 권장)")
+    p.add_argument("--num_workers", type=int,   default=0)
+    p.add_argument("--n_folds",     type=int,   default=5)
+    p.add_argument("--use_pseudo_v2", action="store_true", default=False,
+                   help="pseudo_v2.csv (확신도 0.01/0.99 필터) 를 train fold 에 병합")
 
     # 학습
-    parser.add_argument("--epochs",          type=int,   default=30)
-    parser.add_argument("--batch_size",      type=int,   default=16)
-    parser.add_argument("--lr",              type=float, default=3e-4)
-    parser.add_argument("--weight_decay",    type=float, default=1e-4)
-    parser.add_argument("--label_smoothing", type=float, default=0.1)
+    p.add_argument("--epochs",     type=int,   default=30)
+    p.add_argument("--batch_size", type=int,   default=16)
+    p.add_argument("--lr",         type=float, default=3e-4)
+    p.add_argument("--weight_decay", type=float, default=0.05,
+                   help="AdamW weight decay (고체급 모델 과적합 방지: 0.05 권장)")
 
     # 모델
-    parser.add_argument("--pretrained",     action="store_true",  default=True)
-    parser.add_argument("--no_pretrained",  dest="pretrained",    action="store_false")
-    parser.add_argument("--share_backbone", action="store_true",  default=False)
-    parser.add_argument("--dropout",        type=float,           default=0.3)
+    p.add_argument("--pretrained",    action="store_true",  default=True)
+    p.add_argument("--no_pretrained", dest="pretrained",    action="store_false")
+    p.add_argument("--dropout",       type=float, default=0.3)
 
-    # Physics Consistency Regularization
-    parser.add_argument(
-        "--pcs_lambda", type=float, default=0.1,
-        help="PhysicsConsistencyLoss 가중치. 0이면 비활성. (권장: 0.05~0.2)",
-    )
-    parser.add_argument(
-        "--pcs_temperature", type=float, default=2.0,
-        help="PhysicsConsistencyLoss KL divergence 온도 스케일",
-    )
+    # Loss
+    p.add_argument("--focal_gamma",      type=float, default=3.0,
+                   help="FocalLoss gamma (3.0 = 결정 경계 날카롭게)")
+    p.add_argument("--label_smoothing",  type=float, default=0.05,
+                   help="Label Smoothing (0.05 = 확신도 강화)")
+    p.add_argument("--pcs_lambda",       type=float, default=0.1)
+    p.add_argument("--pcs_temperature",  type=float, default=2.0)
 
     # 증강
-    parser.add_argument("--mixup_alpha",  type=float, default=0.2)
-    parser.add_argument("--cutmix_alpha", type=float, default=1.0)
-    parser.add_argument("--cutmix_prob",  type=float, default=0.5)
+    p.add_argument("--mixup_alpha",  type=float, default=0.2)
+    p.add_argument("--cutmix_alpha", type=float, default=1.0)
+    p.add_argument("--cutmix_prob",  type=float, default=0.5)
 
     # 출력
-    parser.add_argument("--save_dir",    type=str, default="checkpoints")
-    parser.add_argument("--output_csv",  type=str, default="submission.csv")
-    parser.add_argument("--report_file", type=str, default="report.md")
-    parser.add_argument("--seed",        type=int, default=42)
-
-    # 데이터 전략
-    parser.add_argument("--merge_dev",   action="store_true", default=False)
-    parser.add_argument("--use_pseudo",  action="store_true", default=False)
+    p.add_argument("--save_dir",    default="checkpoints")
+    p.add_argument("--report_file", default="report.md")
+    p.add_argument("--seed",        type=int,   default=42)
 
     # 조기 종료
-    parser.add_argument("--patience", type=int, default=7)
+    p.add_argument("--patience", type=int, default=7)
 
-    return parser.parse_args()
+    return p.parse_args()
 
 
-def set_seed(seed: int):
+# ──────────────────────────────────────────────────────────────────
+#  Seed / Augmentation Helpers
+# ──────────────────────────────────────────────────────────────────
+
+def set_seed(seed):
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     np.random.seed(seed)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  CutMix / Mixup
-# ─────────────────────────────────────────────────────────────────────────────
-
 def rand_bbox(size, lam):
-    W, H = size[2], size[3]
-    cut_w = int(W * np.sqrt(1.0 - lam))
-    cut_h = int(H * np.sqrt(1.0 - lam))
+    W, H   = size[2], size[3]
+    cut_w  = int(W * np.sqrt(1.0 - lam))
+    cut_h  = int(H * np.sqrt(1.0 - lam))
     cx, cy = np.random.randint(W), np.random.randint(H)
-    bbx1 = np.clip(cx - cut_w // 2, 0, W)
-    bby1 = np.clip(cy - cut_h // 2, 0, H)
-    bbx2 = np.clip(cx + cut_w // 2, 0, W)
-    bby2 = np.clip(cy + cut_h // 2, 0, H)
-    return bbx1, bby1, bbx2, bby2
+    return (
+        np.clip(cx - cut_w // 2, 0, W), np.clip(cy - cut_h // 2, 0, H),
+        np.clip(cx + cut_w // 2, 0, W), np.clip(cy + cut_h // 2, 0, H),
+    )
 
 
-def mixup_data(x1, x2, x3, y, alpha, device):
-    lam   = np.random.beta(alpha, alpha) if alpha > 0 else 1.0
-    idx   = torch.randperm(x1.size(0)).to(device)
-    mx1   = lam * x1 + (1 - lam) * x1[idx]
-    mx2   = lam * x2 + (1 - lam) * x2[idx]
-    mx3   = lam * x3 + (1 - lam) * x3[idx]
-    return mx1, mx2, mx3, y, y[idx], lam
+def mixup(x1, x2, x3, y, alpha, dev):
+    lam = np.random.beta(alpha, alpha) if alpha > 0 else 1.0
+    idx = torch.randperm(x1.size(0)).to(dev)
+    return (lam*x1 + (1-lam)*x1[idx],
+            lam*x2 + (1-lam)*x2[idx],
+            lam*x3 + (1-lam)*x3[idx],
+            y, y[idx], lam)
 
 
-def cutmix_data(x1, x2, x3, y, alpha, device):
-    lam          = np.random.beta(alpha, alpha) if alpha > 0 else 1.0
-    idx          = torch.randperm(x1.size(0)).to(device)
-    bbx1, bby1, bbx2, bby2 = rand_bbox(x1.size(), lam)
-    x1[:, :, bbx1:bbx2, bby1:bby2] = x1[idx, :, bbx1:bbx2, bby1:bby2]
-    x2[:, :, bbx1:bbx2, bby1:bby2] = x2[idx, :, bbx1:bbx2, bby1:bby2]
-    x3[:, :, bbx1:bbx2, bby1:bby2] = x3[idx, :, bbx1:bbx2, bby1:bby2]
-    lam = 1 - (bbx2 - bbx1) * (bby2 - bby1) / (x1.size(-1) * x1.size(-2))
+def cutmix(x1, x2, x3, y, alpha, dev):
+    lam              = np.random.beta(alpha, alpha) if alpha > 0 else 1.0
+    idx              = torch.randperm(x1.size(0)).to(dev)
+    b1,b2,b3,b4     = rand_bbox(x1.size(), lam)
+    x1[:,:,b1:b3,b2:b4] = x1[idx,:,b1:b3,b2:b4]
+    x2[:,:,b1:b3,b2:b4] = x2[idx,:,b1:b3,b2:b4]
+    x3[:,:,b1:b3,b2:b4] = x3[idx,:,b1:b3,b2:b4]
+    lam = 1 - (b3-b1)*(b4-b2) / (x1.size(-1)*x1.size(-2))
     return x1, x2, x3, y, y[idx], lam
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────
 #  Train / Evaluate
-# ─────────────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────
 
-def train_one_epoch(model, loader, criterion, pcs_loss_fn, optimizer, device, args):
-    """1 에폭 학습.
-
-    total_loss = focal_loss + pcs_lambda * physics_consistency_loss
-    """
+def train_one_epoch(model, loader, criterion, pcs_fn, optimizer, device, args):
     model.train()
-    running_loss      = 0.0
-    running_pcs_loss  = 0.0
-    correct           = 0
-    total             = 0
-    all_labels, all_probs = [], []
+    run_loss = run_pcs = total = correct = 0.0
+    all_lbl, all_prob = [], []
 
-    use_aug = args.mixup_alpha > 0 or args.cutmix_alpha > 0
+    use_aug = (args.mixup_alpha > 0 or args.cutmix_alpha > 0)
 
     for front, top, diff, labels in loader:
-        front  = front.to(device)
-        top    = top.to(device)
-        diff   = diff.to(device)
-        labels = labels.to(device)
-
+        front, top, diff, labels = (
+            front.to(device), top.to(device), diff.to(device), labels.to(device)
+        )
         optimizer.zero_grad()
 
-        # ── CutMix / Mixup ────────────────────────────────────────
         mixed = False
         if use_aug and np.random.rand() < args.cutmix_prob:
-            mixed = True
             if np.random.rand() < 0.5 and args.mixup_alpha > 0:
-                front, top, diff, y_a, y_b, lam = mixup_data(
+                front, top, diff, ya, yb, lam = mixup(
                     front, top, diff, labels, args.mixup_alpha, device)
             elif args.cutmix_alpha > 0:
-                front, top, diff, y_a, y_b, lam = cutmix_data(
+                front, top, diff, ya, yb, lam = cutmix(
                     front, top, diff, labels, args.cutmix_alpha, device)
             else:
                 mixed = False
+            mixed = True
 
         logits = model(front, top, diff)
 
-        # ── Classification Loss ───────────────────────────────────
-        if mixed:
-            cls_loss = lam * criterion(logits, y_a) + (1 - lam) * criterion(logits, y_b)
-        else:
-            cls_loss = criterion(logits, labels)
+        cls_loss = (
+            lam * criterion(logits, ya) + (1-lam) * criterion(logits, yb)
+            if mixed else criterion(logits, labels)
+        )
 
-        # ── Physics Consistency Regularization ────────────────────
         pcs_reg = torch.tensor(0.0, device=device)
         if args.pcs_lambda > 0:
-            pcs_reg = pcs_loss_fn(model, front, top, diff, logits)
+            pcs_reg = pcs_fn(model, front, top, diff, logits)
 
         loss = cls_loss + args.pcs_lambda * pcs_reg
         loss.backward()
         optimizer.step()
 
         bs = front.size(0)
-        running_loss     += loss.item()     * bs
-        running_pcs_loss += pcs_reg.item()  * bs
-        total            += bs
+        run_loss += loss.item() * bs
+        run_pcs  += pcs_reg.item() * bs
+        total    += bs
 
         probs = torch.softmax(logits.detach(), dim=1)[:, 1].cpu().numpy()
-        _, predicted = logits.max(1)
+        _, pred = logits.max(1)
+        correct += (lam*pred.eq(ya).sum().item() + (1-lam)*pred.eq(yb).sum().item()
+                    if mixed else pred.eq(labels).sum().item())
+        all_lbl.extend(labels.cpu().numpy())
+        all_prob.extend(probs)
 
-        if mixed:
-            correct += (lam * predicted.eq(y_a).sum().item()
-                        + (1 - lam) * predicted.eq(y_b).sum().item())
-        else:
-            correct += predicted.eq(labels).sum().item()
-
-        all_labels.extend(labels.cpu().numpy())
-        all_probs.extend(probs)
-
-    epoch_loss     = running_loss     / total
-    epoch_pcs_loss = running_pcs_loss / total
-    epoch_acc      = 100.0 * correct  / total
-    try:
-        epoch_auc = roc_auc_score(all_labels, all_probs)
-    except ValueError:
-        epoch_auc = 0.5
-
-    return epoch_loss, epoch_acc, epoch_auc, epoch_pcs_loss
+    auc = roc_auc_score(all_lbl, all_prob) if len(set(all_lbl)) > 1 else 0.5
+    return run_loss/total, 100*correct/total, auc, run_pcs/total
 
 
 @torch.no_grad()
 def evaluate(model, loader, criterion, device):
-    """검증 평가: Loss / AUC / PCS(물리 일관성 점수) 반환."""
     model.eval()
-    running_loss = 0.0
-    correct      = 0
-    total        = 0
-    all_labels, all_probs = [], []
-    total_pcs, pcs_count  = 0.0, 0
+    run_loss = total = correct = 0.0
+    all_lbl, all_prob = [], []
+    pcs_sum = pcs_n = 0.0
 
     for front, top, diff, labels in loader:
-        front  = front.to(device)
-        top    = top.to(device)
-        diff   = diff.to(device)
-        labels = labels.to(device)
-
+        front, top, diff, labels = (
+            front.to(device), top.to(device), diff.to(device), labels.to(device)
+        )
         logits = model(front, top, diff)
         loss   = criterion(logits, labels)
 
-        running_loss += loss.item() * front.size(0)
-        probs = torch.softmax(logits, dim=1)[:, 1].cpu().numpy()
-        _, predicted = logits.max(1)
-
+        run_loss += loss.item() * front.size(0)
+        probs    = torch.softmax(logits, dim=1)[:, 1].cpu().numpy()
+        _, pred  = logits.max(1)
         total   += labels.size(0)
-        correct += predicted.eq(labels).sum().item()
-        all_labels.extend(labels.cpu().numpy())
-        all_probs.extend(probs)
+        correct += pred.eq(labels).sum().item()
+        all_lbl.extend(labels.cpu().numpy())
+        all_prob.extend(probs)
 
-        # ── PCS: 좌우 반전 일관성 ─────────────────────────────────
-        logits_flip = model(
-            torch.flip(front, dims=[3]),
-            torch.flip(top,   dims=[3]),
-            torch.flip(diff,  dims=[3]),
-        )
-        probs_flip = torch.softmax(logits_flip, dim=1)[:, 1].cpu().numpy()
-        total_pcs  += np.sum(1.0 - np.abs(probs - probs_flip))
-        pcs_count  += len(labels)
+        # PCS
+        lf = torch.flip(front, [3])
+        lt = torch.flip(top,   [3])
+        ld = torch.flip(diff,  [3])
+        probs_f = torch.softmax(model(lf, lt, ld), dim=1)[:, 1].cpu().numpy()
+        pcs_sum += np.sum(1.0 - np.abs(probs - probs_f))
+        pcs_n   += len(labels)
 
-    epoch_loss = running_loss / total
-    epoch_acc  = 100.0 * correct / total
-    epoch_pcs  = total_pcs / pcs_count if pcs_count > 0 else 0.0
-    try:
-        epoch_auc = roc_auc_score(all_labels, all_probs)
-    except ValueError:
-        epoch_auc = 0.5
-
-    return epoch_loss, epoch_acc, epoch_auc, epoch_pcs
+    auc = roc_auc_score(all_lbl, all_prob) if len(set(all_lbl)) > 1 else 0.5
+    ece = compute_ece(np.array(all_prob), np.array(all_lbl))
+    return (run_loss/total, 100*correct/total,
+            auc, pcs_sum/pcs_n, ece,
+            np.array(all_prob), np.array(all_lbl))
 
 
 @torch.no_grad()
-def analyze_errors(model, dataset, device, top_k=5):
-    """Dev 데이터셋에서 모델이 가장 혼동한 샘플 top_k개 분석."""
-    model.eval()
-    loader = DataLoader(dataset, batch_size=16, shuffle=False)
-    errors = []
-
-    for front, top, diff, labels in loader:
-        front  = front.to(device)
-        top    = top.to(device)
-        diff   = diff.to(device)
-        labels = labels.to(device)
-
-        logits = model(front, top, diff)
-        probs  = torch.softmax(logits, dim=1)
-
-        for i in range(len(labels)):
-            true_label   = labels[i].item()
-            unstable_p   = probs[i, 1].item()
-            error_score  = (1.0 - unstable_p) if true_label == 1 else unstable_p
-            pred_label   = "unstable" if unstable_p >= 0.5 else "stable"
-            errors.append(dict(
-                true_label   = "unstable" if true_label == 1 else "stable",
-                pred_label   = pred_label,
-                unstable_prob= unstable_p,
-                error_score  = error_score,
-            ))
-
-    for i, err in enumerate(errors):
-        err["sample_id"] = dataset.ids[i]
-
-    errors.sort(key=lambda x: x["error_score"], reverse=True)
-    return errors[:top_k]
-
-
-@torch.no_grad()
-def predict_test(model, loader, device):
-    """테스트셋 예측 → (sample_ids, probs) 반환."""
+def predict_loader(model, loader, device):
     model.eval()
     all_ids, all_probs = [], []
-
-    for front, top, diff, sample_ids in loader:
-        front = front.to(device)
-        top   = top.to(device)
-        diff  = diff.to(device)
-
-        logits = model(front, top, diff)
-        probs  = torch.softmax(logits, dim=1)
-        all_probs.append(probs.cpu().numpy())
-        all_ids.extend(sample_ids)
-
+    for front, top, diff, ids in loader:
+        out   = model(front.to(device), top.to(device), diff.to(device))
+        probs = torch.softmax(out, dim=1).cpu().numpy()
+        all_probs.append(probs)
+        all_ids.extend(ids)
     return all_ids, np.concatenate(all_probs, axis=0)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────
 #  Report
-# ─────────────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────
 
-def generate_report(history, best_epoch, best_dev_loss, top_errors,
-                    report_path, dev_probs, dev_dataset, best_pcs):
+def generate_report(fold_results, report_path):
     with open(report_path, "w", encoding="utf-8") as f:
-        f.write("# Automated Training Report (Physical Intelligence v4)\n\n")
-        f.write("## 1. 학습 요약\n")
-        f.write(f"- **Best Epoch**: {best_epoch}\n")
-        f.write(f"- **Best Dev Loss**: {best_dev_loss:.4f}\n")
-        f.write(f"- **Best Physical Consistency Score (PCS)**: {best_pcs:.4f}\n\n")
+        f.write("# Automated Training Report (Physical Intelligence v5 — 5-Fold CV)\n\n")
 
-        f.write("## 2. Epoch별 추이\n")
-        f.write("| Epoch | Train Loss | PCS Reg | Train AUC | Dev Loss | Dev AUC | PCS |\n")
-        f.write("|---|---|---|---|---|---|---|\n")
-        for h in history:
-            f.write(
-                f"| {h['epoch']} "
-                f"| {h['train_loss']:.4f} "
-                f"| {h.get('pcs_reg', 0):.4f} "
-                f"| {h['train_auc']:.4f} "
-                f"| {h['dev_loss']:.4f} "
-                f"| {h['dev_auc']:.4f} "
-                f"| {h.get('pcs', 0):.4f} |\n"
-            )
+        f.write("## 1. Fold 요약\n")
+        f.write("| Fold | Best Epoch | Best Dev Loss | Dev AUC | PCS | ECE |\n")
+        f.write("|---|---|---|---|---|---|\n")
+        for r in fold_results:
+            f.write(f"| {r['fold']} | {r['best_epoch']} "
+                    f"| {r['best_loss']:.4f} | {r['best_auc']:.4f} "
+                    f"| {r['best_pcs']:.4f} | {r['best_ece']:.4f} |\n")
 
-        f.write("\n## 3. Top-5 Error Analysis\n")
-        f.write("| Sample ID | True | Predicted | Unstable P | Error Score |\n")
-        f.write("|---|---|---|---|---|\n")
-        for err in top_errors:
-            f.write(
-                f"| `{err['sample_id']}` "
-                f"| {err['true_label']} "
-                f"| {err['pred_label']} "
-                f"| {err['unstable_prob']:.4f} "
-                f"| {err['error_score']:.4f} |\n"
-            )
+        mean_loss = np.mean([r['best_loss'] for r in fold_results])
+        mean_auc  = np.mean([r['best_auc']  for r in fold_results])
+        mean_pcs  = np.mean([r['best_pcs']  for r in fold_results])
+        mean_ece  = np.mean([r['best_ece']  for r in fold_results])
+        f.write(f"| **Mean** | — | **{mean_loss:.4f}** | **{mean_auc:.4f}** "
+                f"| **{mean_pcs:.4f}** | **{mean_ece:.4f}** |\n")
 
-        f.write("\n## 4. 최종 Dev 예측 분포\n")
-        pred_stable   = sum(1 for p in dev_probs if p < 0.5)
-        pred_unstable = len(dev_probs) - pred_stable
-        true_stable   = sum(1 for lbl in dev_dataset.labels if lbl == 0)
-        true_unstable = len(dev_dataset.labels) - true_stable
-        f.write(f"- 실제: Stable {true_stable} / Unstable {true_unstable}\n")
-        f.write(f"- 예측: Stable {pred_stable} / Unstable {pred_unstable}\n")
+        f.write("\n## 2. 지표 설명\n")
+        f.write("- **PCS (Physical Consistency Score)**: 좌우 반전 시 예측 일관성. "
+                "1.0 에 가까울수록 배경 노이즈가 아닌 구조 형상으로 판단.\n")
+        f.write("- **ECE (Expected Calibration Error)**: 예측 확률과 실제 정확도의 "
+                "괴리. 0.0 에 가까울수록 '근거 있는 자신감'.\n")
+        f.write("- **GradCAM Consistency**: 원본/반전 이미지 Activation Map 의 "
+                "Pearson r. 1.0 이면 동일 물리 영역에 주목.\n\n")
+
+        f.write("## 3. Epoch별 추이 (Fold 1)\n")
+        if fold_results:
+            hist = fold_results[0].get("history", [])
+            f.write("| Epoch | Train Loss | PCS Reg | Train AUC "
+                    "| Dev Loss | Dev AUC | PCS | ECE |\n")
+            f.write("|---|---|---|---|---|---|---|---|\n")
+            for h in hist:
+                f.write(f"| {h['epoch']} | {h['train_loss']:.4f} "
+                        f"| {h.get('pcs_reg',0):.4f} | {h['train_auc']:.4f} "
+                        f"| {h['dev_loss']:.4f} | {h['dev_auc']:.4f} "
+                        f"| {h['pcs']:.4f} | {h['ece']:.4f} |\n")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────
 #  Main
-# ─────────────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────
 
 def main():
     args = parse_args()
@@ -375,167 +301,221 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"🖥️  Device: {device}")
+    print(f"📐 Input size: {args.img_size}x{args.img_size}  "
+          f"(weight_decay={args.weight_decay}, γ={args.focal_gamma}, "
+          f"ls={args.label_smoothing})")
 
-    # ── Dataset ───────────────────────────────────────────────────
-    train_transform = get_train_transform(args.img_size)
-    val_transform   = get_val_transform(args.img_size)
-
-    if args.use_pseudo:
-        train_split = "train_merged_pseudo"
-    else:
-        train_split = "train_merged" if args.merge_dev else "train"
-
-    train_dataset = StructuralDataset(args.data_dir, train_split, train_transform, args.img_size)
-    dev_dataset   = StructuralDataset(args.data_dir, "dev",       val_transform,   args.img_size)
-    test_dataset  = StructuralDataset(args.data_dir, "test",      val_transform,   args.img_size)
-
-    train_loader = DataLoader(train_dataset, args.batch_size, shuffle=True,
-                              num_workers=args.num_workers, pin_memory=True)
-    dev_loader   = DataLoader(dev_dataset,   args.batch_size, shuffle=False,
-                              num_workers=args.num_workers, pin_memory=True)
-    test_loader  = DataLoader(test_dataset,  args.batch_size, shuffle=False,
-                              num_workers=args.num_workers, pin_memory=True)
-
-    print(f"📦 Train: {len(train_dataset)} | Dev: {len(dev_dataset)} | Test: {len(test_dataset)}")
-
-    # ── Model ─────────────────────────────────────────────────────
-    model = TripleStreamConvNeXt(
-        num_classes=2,
-        pretrained=args.pretrained,
-        dropout=args.dropout,
-    ).to(device)
-
-    print(f"🧠 Model  : Triple-Stream ConvNeXt-Tiny")
-    print(f"   Params : {count_parameters(model):,}")
-    print(f"   Pretrained: {args.pretrained}")
-    print(f"   PCS λ  : {args.pcs_lambda}  (temperature={args.pcs_temperature})")
-
-    # ── Loss ──────────────────────────────────────────────────────
-    criterion   = FocalLoss(gamma=2.0)
-    pcs_loss_fn = PhysicsConsistencyLoss(temperature=args.pcs_temperature)
-    print("🏷️  Loss  : FocalLoss(γ=2) + PhysicsConsistencyLoss")
-
-    # ── Optimizer / Scheduler ─────────────────────────────────────
-    optimizer = torch.optim.AdamW(model.parameters(),
-                                  lr=args.lr, weight_decay=args.weight_decay)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=args.epochs, eta_min=1e-6)
-
-    # ── Training Loop ─────────────────────────────────────────────
     os.makedirs(args.save_dir, exist_ok=True)
 
-    # 복합 점수: dev_loss - PCS_BONUS_WEIGHT * pcs  (낮을수록 좋음)
-    PCS_BONUS_WEIGHT = 0.05
+    # ── 전체 데이터 통합 ──────────────────────────────────────────
+    full_df    = build_full_df(args.data_dir)
+    pseudo_df  = load_pseudo_v2(args.data_dir) if args.use_pseudo_v2 else None
+    if pseudo_df is not None and len(pseudo_df) > 0:
+        print(f"🔖 Pseudo v2 samples: {len(pseudo_df)} "
+              f"(threshold=0.01/0.99 필터)")
 
-    best_score        = float("inf")
-    best_dev_loss     = float("inf")
-    best_epoch        = 0
-    best_pcs_val      = 0.0
-    epochs_no_improve = 0
-    history           = []
+    labels_arr = np.array([0 if l == "stable" else 1
+                           for l in full_df["label"].tolist()])
 
-    hdr = (f"{'Epoch':>5} | {'TrainLoss':>9} | {'PCSReg':>7} | {'TrAUC':>6} | "
-           f"{'DevLoss':>8} | {'DevAUC':>7} | {'PCS':>6} | {'Score':>8} | {'LR':>9} | Time")
-    print("\n" + "=" * len(hdr))
-    print(hdr)
-    print("=" * len(hdr))
+    # ── 5-Fold Stratified K-Fold ──────────────────────────────────
+    skf          = StratifiedKFold(n_splits=args.n_folds, shuffle=True,
+                                   random_state=args.seed)
+    fold_results = []
+    fold_test_probs = []   # 각 fold 의 test 예측 (앙상블용)
+    test_ids_ref    = None
 
-    for epoch in range(1, args.epochs + 1):
-        t0 = time.time()
+    train_tf = get_train_transform(args.img_size)
+    val_tf   = get_val_transform(args.img_size)
 
-        train_loss, train_acc, train_auc, pcs_reg = train_one_epoch(
-            model, train_loader, criterion, pcs_loss_fn, optimizer, device, args)
-        dev_loss, dev_acc, dev_auc, dev_pcs = evaluate(
-            model, dev_loader, criterion, device)
+    # ── Test DataLoader (공통) ────────────────────────────────────
+    from src.dataset import StructuralDataset
+    test_dataset = StructuralDataset(
+        data_dir=args.data_dir, split="test",
+        transform=val_tf, img_size=args.img_size,
+    )
+    test_loader = DataLoader(test_dataset, batch_size=args.batch_size,
+                             shuffle=False, num_workers=args.num_workers)
 
-        current_lr = optimizer.param_groups[0]["lr"]
-        scheduler.step()
-        elapsed = time.time() - t0
+    for fold_idx, (tr_idx, val_idx) in enumerate(
+            skf.split(np.zeros(len(full_df)), labels_arr), start=1):
 
-        # 복합 점수: dev_loss가 낮고 PCS가 높을수록 좋음
-        score = dev_loss - PCS_BONUS_WEIGHT * dev_pcs
+        print(f"\n{'='*70}")
+        print(f"  FOLD {fold_idx}/{args.n_folds}  "
+              f"| train={len(tr_idx)}  val={len(val_idx)}")
+        print(f"{'='*70}")
 
-        print(
-            f"{epoch:5d} | {train_loss:9.4f} | {pcs_reg:7.4f} | {train_auc:6.4f} | "
-            f"{dev_loss:8.4f} | {dev_auc:7.4f} | {dev_pcs:6.4f} | {score:8.4f} | "
-            f"{current_lr:9.2e} | {elapsed:.1f}s"
+        train_ds = KFoldStructuralDataset(
+            args.data_dir, tr_idx.tolist(), full_df,
+            is_train=True,  transform=train_tf,
+            img_size=args.img_size, pseudo_df=pseudo_df,
+        )
+        val_ds = KFoldStructuralDataset(
+            args.data_dir, val_idx.tolist(), full_df,
+            is_train=False, transform=val_tf,
+            img_size=args.img_size,
+        )
+        train_loader = DataLoader(train_ds, args.batch_size, shuffle=True,
+                                  num_workers=args.num_workers, pin_memory=True)
+        val_loader   = DataLoader(val_ds,   args.batch_size, shuffle=False,
+                                  num_workers=args.num_workers, pin_memory=True)
+
+        # ── Model ────────────────────────────────────────────────
+        model = TripleStreamConvNeXt(
+            num_classes=2, pretrained=args.pretrained, dropout=args.dropout
+        ).to(device)
+
+        criterion = FocalLoss(
+            gamma=args.focal_gamma,
+            label_smoothing=args.label_smoothing,
+        )
+        pcs_fn = PhysicsConsistencyLoss(temperature=args.pcs_temperature)
+
+        # AdamW weight_decay=0.05 (과적합 방지)
+        optimizer = torch.optim.AdamW(
+            model.parameters(), lr=args.lr,
+            weight_decay=args.weight_decay,
+        )
+        # CosineAnnealingWarmRestarts — Local Minima 탈출
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+            optimizer, T_0=10, T_mult=1, eta_min=1e-6,
         )
 
-        history.append(dict(
-            epoch      = epoch,
-            train_loss = train_loss,
-            pcs_reg    = pcs_reg,
-            train_auc  = train_auc,
-            dev_loss   = dev_loss,
-            dev_auc    = dev_auc,
-            pcs        = dev_pcs,
+        # ── Training Loop ────────────────────────────────────────
+        PCS_BONUS = 0.05
+        best_score        = float("inf")
+        best_epoch        = 0
+        best_loss_val     = float("inf")
+        best_auc_val      = 0.0
+        best_pcs_val      = 0.0
+        best_ece_val      = 1.0
+        epochs_no_improve = 0
+        history           = []
+
+        hdr = (f"{'Ep':>3} | {'TrLoss':>7} | {'PCSReg':>6} | "
+               f"{'TrAUC':>6} | {'VLoss':>7} | {'VAUC':>6} | "
+               f"{'PCS':>6} | {'ECE':>6} | {'Score':>7} | Time")
+        print(hdr)
+        print("-" * len(hdr))
+
+        for epoch in range(1, args.epochs + 1):
+            t0 = time.time()
+            tr_loss, tr_acc, tr_auc, pcs_reg = train_one_epoch(
+                model, train_loader, criterion, pcs_fn, optimizer, device, args)
+            v_loss, v_acc, v_auc, v_pcs, v_ece, v_probs, v_lbls = evaluate(
+                model, val_loader, criterion, device)
+            scheduler.step(epoch - 1)   # CosineWarmRestarts 는 실제 step 수 기반
+
+            score = v_loss - PCS_BONUS * v_pcs
+            elapsed = time.time() - t0
+
+            print(f"{epoch:3d} | {tr_loss:7.4f} | {pcs_reg:6.4f} | "
+                  f"{tr_auc:6.4f} | {v_loss:7.4f} | {v_auc:6.4f} | "
+                  f"{v_pcs:6.4f} | {v_ece:6.4f} | {score:7.4f} | {elapsed:.1f}s")
+
+            history.append(dict(
+                epoch=epoch, train_loss=tr_loss, pcs_reg=pcs_reg,
+                train_auc=tr_auc, dev_loss=v_loss, dev_auc=v_auc,
+                pcs=v_pcs, ece=v_ece,
+            ))
+
+            if score < best_score:
+                best_score        = score
+                best_loss_val     = v_loss
+                best_auc_val      = v_auc
+                best_pcs_val      = v_pcs
+                best_ece_val      = v_ece
+                best_epoch        = epoch
+                epochs_no_improve = 0
+                ckpt_path = os.path.join(args.save_dir,
+                                         f"best_fold{fold_idx}.pth")
+                torch.save(dict(
+                    epoch=epoch,
+                    model_state_dict=model.state_dict(),
+                    dev_loss=v_loss, dev_auc=v_auc,
+                    dev_pcs=v_pcs,  dev_ece=v_ece,
+                    composite_score=score,
+                    args=vars(args),
+                ), ckpt_path)
+                print(f"  ✅ Fold{fold_idx} best  "
+                      f"Loss={v_loss:.4f} AUC={v_auc:.4f} "
+                      f"PCS={v_pcs:.4f} ECE={v_ece:.4f}")
+            else:
+                epochs_no_improve += 1
+                if epochs_no_improve >= args.patience:
+                    print(f"  ⏹️  Early stop @ epoch {epoch}")
+                    break
+
+        # ── Fold 종료: best model 로 test 예측 ──────────────────
+        ckpt = torch.load(os.path.join(args.save_dir, f"best_fold{fold_idx}.pth"),
+                          map_location=device, weights_only=True)
+        model.load_state_dict(ckpt["model_state_dict"])
+
+        # GradCAM Consistency (val set 첫 샘플)
+        try:
+            sample_front, sample_top, sample_diff, _ = val_ds[0]
+            gc_score = compute_gradcam_consistency(
+                model,
+                sample_front.unsqueeze(0),
+                sample_top.unsqueeze(0),
+                sample_diff.unsqueeze(0),
+                device,
+            )
+        except Exception:
+            gc_score = float("nan")
+
+        print(f"  🎨 GradCAM Consistency (val[0]): {gc_score:.4f}")
+
+        fold_results.append(dict(
+            fold=fold_idx,
+            best_epoch=best_epoch,
+            best_loss=best_loss_val,
+            best_auc=best_auc_val,
+            best_pcs=best_pcs_val,
+            best_ece=best_ece_val,
+            gradcam_consistency=gc_score,
+            history=history,
         ))
 
-        # Best 모델 저장 (복합 점수 기준)
-        if score < best_score:
-            best_score        = score
-            best_dev_loss     = dev_loss
-            best_pcs_val      = dev_pcs
-            best_epoch        = epoch
-            epochs_no_improve = 0
-            ckpt_path = os.path.join(args.save_dir, "best_model.pth")
-            torch.save(dict(
-                epoch              = epoch,
-                model_state_dict   = model.state_dict(),
-                optimizer_state_dict = optimizer.state_dict(),
-                dev_loss           = dev_loss,
-                dev_auc            = dev_auc,
-                dev_pcs            = dev_pcs,
-                composite_score    = score,
-                args               = vars(args),
-            ), ckpt_path)
-            print(f"  ✅ Best saved  Dev Loss={dev_loss:.4f}  PCS={dev_pcs:.4f}  Score={score:.4f}")
-        else:
-            epochs_no_improve += 1
-            print(f"  ⚠️  No improvement {epochs_no_improve}/{args.patience}")
+        t_ids, t_probs = predict_loader(model, test_loader, device)
+        fold_test_probs.append(t_probs)
+        if test_ids_ref is None:
+            test_ids_ref = t_ids
 
-        if epochs_no_improve >= args.patience:
-            print(f"\n⏹️  Early stopping at epoch {epoch}.")
-            break
+        print(f"  Fold {fold_idx} complete ─ "
+              f"Best epoch={best_epoch}  Loss={best_loss_val:.4f}  "
+              f"AUC={best_auc_val:.4f}  ECE={best_ece_val:.4f}")
 
-    print("=" * len(hdr))
-    print(f"\n🏆 Best  Dev Loss={best_dev_loss:.4f}  PCS={best_pcs_val:.4f}  @ Epoch {best_epoch}")
-
-    # ── Best 모델 로드 & Error Analysis ──────────────────────────
-    print("\n🔍 Analyzing Top-5 Errors on Dev Dataset...")
-    ckpt = torch.load(os.path.join(args.save_dir, "best_model.pth"),
-                      map_location=device, weights_only=True)
-    model.load_state_dict(ckpt["model_state_dict"])
-
-    top_errors = analyze_errors(model, dev_dataset, device, top_k=5)
-
-    # ── Dev probs 수집 (버그 수정: 반드시 3인자 호출) ─────────────
-    model.eval()
-    dev_probs = []
-    with torch.no_grad():
-        for front, top, diff, _labels in dev_loader:          # diff 반드시 unpack
-            logits = model(front.to(device), top.to(device), diff.to(device))
-            p = torch.softmax(logits, dim=1)[:, 1].cpu().numpy()
-            dev_probs.extend(p)
-
-    # ── Report ────────────────────────────────────────────────────
-    report_path = os.path.join(os.getcwd(), args.report_file)
-    best_pcs_in_history = max(h["pcs"] for h in history)
-    generate_report(history, best_epoch, best_dev_loss, top_errors,
-                    report_path, dev_probs, dev_dataset, best_pcs_in_history)
-    print(f"📊 Report saved : {report_path}")
-
-    # ── Test Prediction ───────────────────────────────────────────
-    print("\n📝 Generating test predictions...")
-    test_ids, test_probs = predict_test(model, test_loader, device)
+    # ── 5-Fold Soft-Voting Ensemble ───────────────────────────────
+    print("\n🗳️  Soft-Voting Ensemble (5 folds)...")
+    ensemble_probs = np.mean(fold_test_probs, axis=0)   # (N, 2)
 
     submission = pd.DataFrame({
-        "id":            test_ids,
-        "unstable_prob": test_probs[:, 1],
-        "stable_prob":   test_probs[:, 0],
+        "id":            test_ids_ref,
+        "unstable_prob": ensemble_probs[:, 1],
+        "stable_prob":   ensemble_probs[:, 0],
     })
-    submission.to_csv(args.output_csv, index=False)
-    print(f"💾 Submission saved: {args.output_csv}")
+    out_csv = os.path.join(os.getcwd(), "submission.csv")
+    submission.to_csv(out_csv, index=False)
+    print(f"💾 Submission saved: {out_csv}")
+
+    # 예측 통계
+    u_prob = ensemble_probs[:, 1]
+    print(f"   Avg unstable_prob : {u_prob.mean():.4f}")
+    print(f"   Unstable (≥0.5)   : {(u_prob >= 0.5).sum()}")
+    print(f"   Stable   (<0.5)   : {(u_prob < 0.5).sum()}")
+
+    # ── Report ───────────────────────────────────────────────────
+    report_path = os.path.join(os.getcwd(), args.report_file)
+    generate_report(fold_results, report_path)
+    print(f"📊 Report saved: {report_path}")
+
+    # Fold 평균 요약
+    print("\n" + "="*50)
+    print("📈 5-Fold CV Summary")
+    print(f"   Mean Dev Loss : {np.mean([r['best_loss'] for r in fold_results]):.4f}")
+    print(f"   Mean Dev AUC  : {np.mean([r['best_auc']  for r in fold_results]):.4f}")
+    print(f"   Mean PCS      : {np.mean([r['best_pcs']  for r in fold_results]):.4f}")
+    print(f"   Mean ECE      : {np.mean([r['best_ece']  for r in fold_results]):.4f}")
     print("✨ Done!")
 
 

@@ -1,142 +1,159 @@
 """
-Best model 로드 후 test 데이터 예측 → submission.csv 생성
+Dacon 구조 안정성 분류 - 앙상블 예측 스크립트 (v5)
+=====================================================
+5개 Fold Best Model 을 Soft-Voting 으로 앙상블 + TTA 적용.
+
+사용법:
+    python src/predict.py --data_dir data --n_folds 5
+    python src/predict.py --tta_steps 3   # 원본 + H-Flip + ColorJitter
 """
-import os, sys
+
+import argparse
+import os
+import sys
 import warnings
+
 import numpy as np
 import pandas as pd
 import torch
-from torchvision import transforms
 from torch.utils.data import DataLoader
+from torchvision import transforms
 
 warnings.filterwarnings("ignore", category=UserWarning)
-
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.dataset import StructuralDataset, get_val_transform
 from src.model import TripleStreamConvNeXt
 
-def main():
-    data_dir = "data"
-    ckpt_path = "checkpoints/best_model.pth"
-    output_csv = "submission.csv"
-    img_size = 224
-    batch_size = 16
 
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("--data_dir",   default="data")
+    p.add_argument("--save_dir",   default="checkpoints")
+    p.add_argument("--output_csv", default="submission.csv")
+    p.add_argument("--img_size",   type=int, default=268)
+    p.add_argument("--batch_size", type=int, default=16)
+    p.add_argument("--n_folds",    type=int, default=5)
+    p.add_argument("--tta_steps",  type=int, default=3,
+                   help="TTA 변환 수 (1=원본만, 3=원본+HFlip+ColorJitter)")
+    return p.parse_args()
+
+
+def build_tta_transforms(img_size, n_steps):
+    base = get_val_transform(img_size)
+    tfs  = [base]
+    if n_steps >= 2:
+        tfs.append(transforms.Compose([
+            transforms.RandomHorizontalFlip(p=1.0),
+            base,
+        ]))
+    if n_steps >= 3:
+        tfs.append(transforms.Compose([
+            transforms.ColorJitter(brightness=0.1, contrast=0.1),
+            base,
+        ]))
+    return tfs
+
+
+def predict_with_model(model, dataset, batch_size, device, tta_transforms):
+    """단일 모델 + TTA 예측 → (ids, probs(N,2))"""
+    all_ids     = None
+    sum_probs   = None
+
+    for t_idx, tf in enumerate(tta_transforms):
+        dataset.transform = tf
+        loader = DataLoader(dataset, batch_size=batch_size,
+                            shuffle=False, num_workers=0)
+        step_ids, step_probs = [], []
+        with torch.no_grad():
+            for front, top, diff, ids in loader:
+                out   = model(front.to(device), top.to(device), diff.to(device))
+                probs = torch.softmax(out, dim=1).cpu().numpy()
+                step_probs.append(probs)
+                if t_idx == 0:
+                    step_ids.extend(ids)
+        step_probs = np.concatenate(step_probs, axis=0)
+        if sum_probs is None:
+            sum_probs = step_probs
+            all_ids   = step_ids
+        else:
+            sum_probs += step_probs
+
+    return all_ids, sum_probs / len(tta_transforms)
+
+
+def main():
+    args   = parse_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"🖥️  Device: {device}")
 
-    # 체크포인트 로드
-    print(f"📦 Loading checkpoint: {ckpt_path}")
-    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
-    saved_args = ckpt.get("args", {})
-    best_metric_str = f"Dev Loss: {ckpt.get('dev_loss', 'N/A'):.4f}" if 'dev_loss' in ckpt else f"Dev AUC: {ckpt.get('dev_auc', 'N/A'):.4f}"
-    print(f"   Saved at epoch {ckpt['epoch']} with {best_metric_str}")
+    val_tf  = get_val_transform(args.img_size)
+    tta_tfs = build_tta_transforms(args.img_size, args.tta_steps)
+    print(f"🔄 TTA steps: {len(tta_tfs)}")
 
-    # 모델 생성 & 가중치 로드
-    model = TripleStreamConvNeXt(
-        num_classes=2,
-        pretrained=False,
-        dropout=saved_args.get("dropout", 0.3),
-    ).to(device)
-    model.load_state_dict(ckpt["model_state_dict"])
-    model.eval()
-    print("✅ Model loaded successfully")
-
-    # 테스트 데이터셋
-    val_transform = get_val_transform(img_size)
     test_dataset = StructuralDataset(
-        data_dir=data_dir, split="test",
-        transform=val_transform, img_size=img_size,
+        data_dir=args.data_dir, split="test",
+        transform=val_tf, img_size=args.img_size,
     )
-    
-    # ── TTA (Test Time Augmentation) 설정 ─────────────────────────
-    # 원본 + 좌우반전 + 미세한 Brightness/Contrast (수직 반전 제외)
-    tta_transforms = [
-        val_transform,
-        transforms.Compose([transforms.RandomHorizontalFlip(p=1.0), val_transform]),
-        transforms.Compose([
-            transforms.ColorJitter(brightness=0.1, contrast=0.1), 
-            val_transform
-        ]),
-    ]
-    print(f"🔄 TTA enabled: {len(tta_transforms)} augmentations (Orig, H-Flip, ColorJitter)")
 
-    # 예측
-    all_ids = []
-    final_probs = None
+    ensemble_probs = None
+    final_ids      = None
+    loaded_folds   = 0
 
-    for t_idx, tta_tf in enumerate(tta_transforms):
-        print(f"   - TTA step {t_idx+1}/{len(tta_transforms)}...")
-        # 임시 데이터셋/로더 (transform만 교체)
-        test_dataset.transform = tta_tf
-        test_loader = DataLoader(
-            test_dataset, batch_size=batch_size,
-            shuffle=False, num_workers=0, pin_memory=True,
-        )
-        
-        step_probs = []
-        step_ids = []
-        with torch.no_grad():
-            for front, top, diff, sample_ids in test_loader:
-                front = front.to(device)
-                top = top.to(device)
-                diff = diff.to(device)
-                outputs = model(front, top, diff)
-                probs = torch.softmax(outputs, dim=1).cpu().numpy()  # (B, 2)
-                step_probs.append(probs)
-                if t_idx == 0:
-                    step_ids.extend(sample_ids)
-        
-        step_probs = np.concatenate(step_probs, axis=0)
-        if final_probs is None:
-            final_probs = step_probs
-            all_ids = step_ids
+    for fold_idx in range(1, args.n_folds + 1):
+        ckpt_path = os.path.join(args.save_dir, f"best_fold{fold_idx}.pth")
+        if not os.path.exists(ckpt_path):
+            print(f"  ⚠️  {ckpt_path} 없음, 건너뜀")
+            continue
+
+        ckpt       = torch.load(ckpt_path, map_location=device, weights_only=False)
+        saved_args = ckpt.get("args", {})
+        model      = TripleStreamConvNeXt(
+            num_classes=2, pretrained=False,
+            dropout=saved_args.get("dropout", 0.3),
+        ).to(device)
+        model.load_state_dict(ckpt["model_state_dict"])
+        model.eval()
+        print(f"  ✅ Fold {fold_idx} loaded "
+              f"(epoch={ckpt['epoch']}, Loss={ckpt.get('dev_loss',0):.4f}, "
+              f"AUC={ckpt.get('dev_auc',0):.4f})")
+
+        ids, probs = predict_with_model(
+            model, test_dataset, args.batch_size, device, tta_tfs)
+
+        if ensemble_probs is None:
+            ensemble_probs = probs
+            final_ids      = ids
         else:
-            final_probs += step_probs
+            ensemble_probs += probs
+        loaded_folds += 1
 
-    # TTA 평균 계산
-    all_probs = final_probs / len(tta_transforms)
+    if loaded_folds == 0:
+        raise RuntimeError("유효한 checkpoint 가 없습니다. train.py 를 먼저 실행하세요.")
 
-    # ── 확률 정규화 (Clipping 제거) ──────────────────────────────
-    # 합계 1.0 확인 및 개별 확률 추출
-    unstable_probs = all_probs[:, 1]
-    stable_probs = all_probs[:, 0]
+    ensemble_probs /= loaded_folds
+    print(f"\n🗳️  Ensemble from {loaded_folds} fold(s)")
 
-    # ── submission.csv 생성 (id, unstable_prob, stable_prob 순서) ──
     submission = pd.DataFrame({
-        "id": all_ids,
-        "unstable_prob": unstable_probs,
-        "stable_prob": stable_probs,
+        "id":            final_ids,
+        "unstable_prob": ensemble_probs[:, 1],
+        "stable_prob":   ensemble_probs[:, 0],
     })
-    
-    # 컬럼 순서 재확인 (혹시 모를 상황 대비)
-    submission = submission[["id", "unstable_prob", "stable_prob"]]
-    
-    submission.to_csv(output_csv, index=False)
-    print(f"\n💾 Submission saved: {output_csv}")
-    print(f"   Total predictions: {len(submission)}")
-    
-    # ── 검증 ──────────────────────────────────────────────────
-    print("\n🔍 Validating submission...")
-    # 1. 합계 검증
-    sums = submission["unstable_prob"] + submission["stable_prob"]
-    is_sum_one = np.allclose(sums, 1.0)
-    print(f"   - Sum of probabilities is 1.0: {'TRUE' if is_sum_one else 'FALSE'}")
-    
-    # 2. 범위 검증 (Clipping 제거되었으므로 0~1 사이인지 확인)
-    is_in_range = (submission["unstable_prob"].min() >= 0.0) and (submission["unstable_prob"].max() <= 1.0)
-    print(f"   - Probabilities within [0.0, 1.0]: {'TRUE' if is_in_range else 'FALSE'}")
-    
-    # 3. 컬럼 순서 검증
-    is_correct_order = list(submission.columns) == ["id", "unstable_prob", "stable_prob"]
-    print(f"   - Column order is correct: {'TRUE' if is_correct_order else 'FALSE'}")
+    submission.to_csv(args.output_csv, index=False)
+    print(f"💾 Submission: {args.output_csv}")
 
-    print(f"\n📈 Statistics (TTA applied):")
-    print(f"   Avg unstable_prob: {submission['unstable_prob'].mean():.4f}")
-    print(f"   Unstable 예측 (prob >= 0.5): {(unstable_probs >= 0.5).sum()}")
-    print(f"   Stable 예측 (prob < 0.5): {(unstable_probs < 0.5).sum()}")
+    u = ensemble_probs[:, 1]
+    print(f"   Avg unstable_prob : {u.mean():.4f}")
+    print(f"   Unstable (≥0.5)   : {(u >= 0.5).sum()}")
+    print(f"   Stable   (<0.5)   : {(u < 0.5).sum()}")
+
+    # 검증
+    sums     = ensemble_probs.sum(axis=1)
+    in_range = (u.min() >= 0.0) and (u.max() <= 1.0)
+    print(f"   Sum==1.0          : {np.allclose(sums, 1.0)}")
+    print(f"   In [0,1]          : {in_range}")
     print("✨ Done!")
+
 
 if __name__ == "__main__":
     main()

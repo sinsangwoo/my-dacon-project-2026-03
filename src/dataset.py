@@ -1,204 +1,257 @@
+"""
+Dacon 구조 안정성 분류 - Dataset (v5: 5-Fold CV 대응)
+=======================================================
+주요 변경:
+  - KFoldStructuralDataset: train+dev 전체를 통합하여 fold 인덱스로 분할
+  - pseudo_v2.csv 지원 (확신도 0.01/0.99 필터링된 고신뢰 샘플)
+  - img_size 파라미터로 입력 해상도 유연 조정 (권장: 268 = 224 * 1.2)
+"""
+
 import os
+import random
+
+import cv2
+import numpy as np
 import pandas as pd
 from PIL import Image
+
 import torch
 from torch.utils.data import Dataset
 from torchvision import transforms
-import cv2
-import numpy as np
 
-LABEL_MAP = {"stable": 0, "unstable": 1}
+LABEL_MAP     = {"stable": 0, "unstable": 1}
 LABEL_MAP_INV = {v: k for k, v in LABEL_MAP.items()}
 
-class StructuralDataset(Dataset):
-    """구조 안정성 이진 분류 Dataset (Triple-Stream용).
 
-    각 샘플 폴더에서 front.png, top.png와 simulation.mp4(Diff)를 로드하여
-    **3개의 텐서** (3, H, W)를 반환합니다.
+# ──────────────────────────────────────────────────────────────────
+#  KFoldStructuralDataset  (5-Fold CV 전용)
+# ──────────────────────────────────────────────────────────────────
 
-    Returns:
-        (front_tensor, top_tensor, diff_tensor, label)  — train/dev
-        (front_tensor, top_tensor, diff_tensor, sample_id) — test
+class KFoldStructuralDataset(Dataset):
+    """5-Fold Cross-Validation 용 Dataset.
+
+    train.csv + dev.csv 를 통합한 전체 라벨 데이터를 fold_indices 로 분할.
+    pseudo_v2.csv 가 존재하면 train fold 에만 추가 병합.
+
+    Args:
+        data_dir:     데이터 루트 디렉토리
+        fold_indices: 이 Dataset 이 사용할 샘플 인덱스 리스트
+        all_df:       전체 통합 DataFrame (id, label, split 컬럼 필수)
+        is_train:     True → 학습용 (augmentation 적용)
+        transform:    None 이면 기본 transform 사용
+        img_size:     입력 해상도 (권장 268)
+        pseudo_df:    고신뢰 pseudo label DataFrame (is_train=True 일 때만 병합)
     """
 
     def __init__(
         self,
         data_dir: str,
-        split: str = "train",
+        fold_indices: list,
+        all_df: pd.DataFrame,
+        is_train: bool = True,
         transform=None,
-        img_size: int = 224,
+        img_size: int = 268,
+        pseudo_df: pd.DataFrame = None,
     ):
         super().__init__()
         self.data_dir = data_dir
-        self.split = split
         self.img_size = img_size
+        self.is_train = is_train
 
-        # ── CSV 로드 ──────────────────────────────────────────────
-        if split == "train":
-            csv_path = os.path.join(data_dir, "train.csv")
-            self.df = pd.read_csv(csv_path)
-        elif split == "dev":
-            csv_path = os.path.join(data_dir, "dev.csv")
-            self.df = pd.read_csv(csv_path)
-        elif split == "train_merged":
-            train_df = pd.read_csv(os.path.join(data_dir, "train.csv"))
-            dev_df = pd.read_csv(os.path.join(data_dir, "dev.csv"))
-            train_df["split"] = "train"
-            dev_df["split"] = "dev"
-            self.df = pd.concat([train_df, dev_df], ignore_index=True)
-        elif split == "train_merged_pseudo":
-            train_df = pd.read_csv(os.path.join(data_dir, "train.csv"))
-            dev_df = pd.read_csv(os.path.join(data_dir, "dev.csv"))
-            train_df["split"] = "train"
-            dev_df["split"] = "dev"
-            dfs = [train_df, dev_df]
-            
-            pseudo_path = os.path.join(data_dir, "pseudo_train.csv")
-            if os.path.exists(pseudo_path):
-                pseudo_df = pd.read_csv(pseudo_path)
-                pseudo_df["split"] = "test"
-                dfs.append(pseudo_df)
-                
-            self.df = pd.concat(dfs, ignore_index=True)
-        elif split == "test":
-            csv_path = os.path.join(data_dir, "sample_submission.csv")
-            self.df = pd.read_csv(csv_path)
-        else:
-            raise ValueError(f"Unknown split: {split}")
+        # fold 인덱스로 슬라이싱
+        fold_df = all_df.iloc[fold_indices].copy().reset_index(drop=True)
 
-        self.ids = self.df["id"].tolist()
+        # train fold 에만 pseudo 병합
+        if is_train and pseudo_df is not None and len(pseudo_df) > 0:
+            fold_df = pd.concat([fold_df, pseudo_df], ignore_index=True)
 
-        # ── 라벨 ─────────────────────────────────────────────────
-        self.has_label = split in ("train", "dev", "train_merged", "train_merged_pseudo")
-        if self.has_label:
-            self.labels = [LABEL_MAP[lbl] for lbl in self.df["label"].tolist()]
+        self.df     = fold_df
+        self.ids    = fold_df["id"].tolist()
+        self.labels = [LABEL_MAP[lbl] for lbl in fold_df["label"].tolist()]
+        self.splits = fold_df["split"].tolist()   # 'train' | 'dev' | 'test'(pseudo)
 
-        # ── 이미지 폴더 경로 ──────────────────────────────────────
-        self.split_dir_map = {"train": "train", "dev": "dev", "test": "test"}
-
-        # ── Transform ─────────────────────────────────────────────
-        if transform is not None:
-            self.transform = transform
-        else:
-            self.transform = get_val_transform(img_size)
+        self.transform = transform if transform is not None else get_val_transform(img_size)
 
     def __len__(self) -> int:
         return len(self.ids)
 
-    def _get_diff_map(self, video_path):
-        """simulation.mp4에서 시작 프레임과 끝 프레임의 차이맵 추출."""
+    def _img_root(self, idx: int) -> str:
+        sp = self.splits[idx]
+        return os.path.join(self.data_dir, sp if sp in ("train", "dev") else "test")
+
+    def _get_diff_map(self, video_path: str) -> Image.Image:
+        blank = Image.new("RGB", (self.img_size, self.img_size), (0, 0, 0))
         if not os.path.exists(video_path):
-            return Image.new("RGB", (self.img_size, self.img_size), (0, 0, 0))
-            
+            return blank
         cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
-            return Image.new("RGB", (self.img_size, self.img_size), (0, 0, 0))
-            
-        # 첫 프레임
+            return blank
         ret, frame_start = cap.read()
         if not ret:
             cap.release()
-            return Image.new("RGB", (self.img_size, self.img_size), (0, 0, 0))
-            
-        # 마지막 프레임 찾기
-        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        if frame_count > 1:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_count - 1)
+            return blank
+        n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        if n > 1:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, n - 1)
             ret, frame_end = cap.read()
             if not ret:
                 frame_end = frame_start
         else:
             frame_end = frame_start
-            
         cap.release()
-        
-        # Difference Map 계산
         diff = cv2.absdiff(frame_start, frame_end)
         diff = cv2.cvtColor(diff, cv2.COLOR_BGR2RGB)
         return Image.fromarray(diff)
 
     def __getitem__(self, idx: int):
-        sample_id = self.ids[idx]
-        
-        if self.split in ("train_merged", "train_merged_pseudo"):
-            orig_split = self.df.iloc[idx]["split"]
-            img_root = os.path.join(self.data_dir, self.split_dir_map[orig_split])
-        else:
-            img_root = os.path.join(self.data_dir, self.split_dir_map[self.split])
-            
-        folder = os.path.join(img_root, sample_id)
+        sid    = self.ids[idx]
+        folder = os.path.join(self._img_root(idx), sid)
 
-        # 1. Front/Top 이미지 로드
         front_img = Image.open(os.path.join(folder, "front.png")).convert("RGB")
-        top_img = Image.open(os.path.join(folder, "top.png")).convert("RGB")
-        
-        # 2. Difference Map (Temporal Feature)
-        video_path = os.path.join(folder, "simulation.mp4")
-        diff_img = self._get_diff_map(video_path)
+        top_img   = Image.open(os.path.join(folder, "top.png")).convert("RGB")
+        diff_img  = self._get_diff_map(os.path.join(folder, "simulation.mp4"))
 
-        # 3. 일관된 증강 기술 (Random Seed 공유)
-        seed = np.random.randint(2147483647)
-        
-        def apply_transform(img, seed):
-            import random
+        # 세 스트림에 동일한 랜덤 변환 적용 (공유 seed)
+        seed = np.random.randint(2_147_483_647)
+
+        def _apply(img):
             random.seed(seed)
             torch.manual_seed(seed)
-            if torch.cuda.is_available():
-                torch.cuda.manual_seed_all(seed)
             return self.transform(img)
 
-        front_tensor = apply_transform(front_img, seed)
-        top_tensor   = apply_transform(top_img, seed)
-        diff_tensor  = apply_transform(diff_img, seed)
-
-        if self.has_label:
-            y = self.labels[idx]
-            return front_tensor, top_tensor, diff_tensor, y
-        else:
-            return front_tensor, top_tensor, diff_tensor, sample_id
+        return _apply(front_img), _apply(top_img), _apply(diff_img), self.labels[idx]
 
 
-# ═══════════════════════════════════════════════════════════════════
-#  Physics-Aware Augmentation
-# ═══════════════════════════════════════════════════════════════════
+# ──────────────────────────────────────────────────────────────────
+#  StructuralDataset  (test 예측 전용 / 하위 호환)
+# ──────────────────────────────────────────────────────────────────
 
-def get_train_transform(img_size: int = 224):
-    """학습용 Physics-Aware Augmentation.
+class StructuralDataset(Dataset):
+    """test 데이터 예측 전용 Dataset.
 
-    - 구조적 형태를 크게 해치지 않는 범위의 회전 (±15°)
-    - ColorJitter 강화 (밝기/대비/채도/색상)
-    - GaussianBlur (시뮬레이션 렌더링 노이즈 대응)
-    - RandomHorizontalFlip
-    - RandomAffine (미세한 이동/스케일 변동)
+    split='test' 만 지원. predict.py 에서 사용.
     """
+
+    def __init__(self, data_dir, split="test", transform=None, img_size=268):
+        super().__init__()
+        self.data_dir = data_dir
+        self.split    = split
+        self.img_size = img_size
+
+        if split == "test":
+            csv_path = os.path.join(data_dir, "sample_submission.csv")
+        else:
+            raise ValueError(f"StructuralDataset은 'test' split만 지원합니다. 학습에는 KFoldStructuralDataset 사용.")
+
+        self.df        = pd.read_csv(csv_path)
+        self.ids       = self.df["id"].tolist()
+        self.has_label = False
+        self.transform = transform if transform is not None else get_val_transform(img_size)
+
+    def __len__(self):
+        return len(self.ids)
+
+    def _get_diff_map(self, video_path):
+        blank = Image.new("RGB", (self.img_size, self.img_size), (0, 0, 0))
+        if not os.path.exists(video_path):
+            return blank
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            return blank
+        ret, fs = cap.read()
+        if not ret:
+            cap.release()
+            return blank
+        n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        if n > 1:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, n - 1)
+            ret, fe = cap.read()
+            if not ret:
+                fe = fs
+        else:
+            fe = fs
+        cap.release()
+        diff = cv2.absdiff(fs, fe)
+        return Image.fromarray(cv2.cvtColor(diff, cv2.COLOR_BGR2RGB))
+
+    def __getitem__(self, idx):
+        sid    = self.ids[idx]
+        folder = os.path.join(self.data_dir, "test", sid)
+        seed   = np.random.randint(2_147_483_647)
+
+        def _apply(img):
+            random.seed(seed)
+            torch.manual_seed(seed)
+            return self.transform(img)
+
+        front = _apply(Image.open(os.path.join(folder, "front.png")).convert("RGB"))
+        top   = _apply(Image.open(os.path.join(folder, "top.png")).convert("RGB"))
+        diff  = _apply(self._get_diff_map(os.path.join(folder, "simulation.mp4")))
+        return front, top, diff, sid
+
+
+# ──────────────────────────────────────────────────────────────────
+#  헬퍼: 전체 통합 DataFrame 빌드
+# ──────────────────────────────────────────────────────────────────
+
+def build_full_df(data_dir: str) -> pd.DataFrame:
+    """train.csv + dev.csv 를 통합하여 id / label / split 컬럼을 가진
+    DataFrame 을 반환한다. 5-Fold 분할의 기반 데이터."""
+    train_df = pd.read_csv(os.path.join(data_dir, "train.csv"))
+    dev_df   = pd.read_csv(os.path.join(data_dir, "dev.csv"))
+    train_df["split"] = "train"
+    dev_df["split"]   = "dev"
+    return pd.concat([train_df, dev_df], ignore_index=True).reset_index(drop=True)
+
+
+def load_pseudo_v2(data_dir: str, threshold: float = 0.01) -> pd.DataFrame:
+    """pseudo_v2.csv 에서 확신도 높은 샘플만 필터링하여 반환.
+
+    pseudo_v2.csv 컬럼: id, unstable_prob, stable_prob
+    threshold:  unstable_prob < threshold → stable,
+                unstable_prob > 1-threshold → unstable 로 라벨링
+    """
+    path = os.path.join(data_dir, "pseudo_v2.csv")
+    if not os.path.exists(path):
+        return pd.DataFrame(columns=["id", "label", "split"])
+
+    df = pd.read_csv(path)
+    stable_mask   = df["unstable_prob"] < threshold
+    unstable_mask = df["unstable_prob"] > (1.0 - threshold)
+    df = df[stable_mask | unstable_mask].copy()
+
+    df["label"] = df["unstable_prob"].apply(
+        lambda p: "unstable" if p > 0.5 else "stable")
+    df["split"] = "test"   # 이미지 경로가 test/ 아래에 있음
+    return df[["id", "label", "split"]].reset_index(drop=True)
+
+
+# ──────────────────────────────────────────────────────────────────
+#  Transforms
+# ──────────────────────────────────────────────────────────────────
+
+def get_train_transform(img_size: int = 268):
+    """Physics-Aware 학습 증강. img_size=268 (224 * 1.2) 권장."""
     return transforms.Compose([
         transforms.Resize((img_size, img_size)),
         transforms.RandomHorizontalFlip(p=0.5),
         transforms.RandomRotation(degrees=15),
-        transforms.RandomAffine(
-            degrees=0, translate=(0.05, 0.05), scale=(0.95, 1.05),
-        ),
-        transforms.ColorJitter(
-            brightness=0.3, contrast=0.3, saturation=0.2, hue=0.05,
-        ),
+        transforms.RandomAffine(degrees=0, translate=(0.05, 0.05), scale=(0.95, 1.05)),
+        transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.2, hue=0.05),
         transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 2.0)),
         transforms.RandomGrayscale(p=0.05),
         transforms.ToTensor(),
-        transforms.Normalize(
-            mean=[0.485, 0.456, 0.406],
-            std=[0.229, 0.224, 0.225],
-        ),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                             std=[0.229, 0.224, 0.225]),
         transforms.RandomErasing(p=0.1, scale=(0.02, 0.1)),
     ])
 
 
-def get_val_transform(img_size: int = 224):
-    """검증/테스트용 transform (augmentation 없음)."""
+def get_val_transform(img_size: int = 268):
+    """검증/테스트용 (augmentation 없음)."""
     return transforms.Compose([
         transforms.Resize((img_size, img_size)),
         transforms.ToTensor(),
-        transforms.Normalize(
-            mean=[0.485, 0.456, 0.406],
-            std=[0.229, 0.224, 0.225],
-        ),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                             std=[0.229, 0.224, 0.225]),
     ])
