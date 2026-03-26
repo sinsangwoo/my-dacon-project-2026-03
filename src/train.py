@@ -169,7 +169,7 @@ def cutmix(x1, x2, x3, y, alpha, dev):
 
 def train_one_epoch(
     model, loader, criterion, pcs_fn, optimizer, scheduler,
-    device, args, use_sam: bool = False
+    device, args, total_steps: int, use_sam: bool = False
 ):
     """1 에포크 학습.
 
@@ -177,6 +177,14 @@ def train_one_epoch(
     그 외엔 일반 backward.
     """
     model.train()
+    # [v6.1] Loss Annealing: Progress > 80% 시점에 LS=0, Gamma=0 (Pure CrossEntropy)
+    current_step = scheduler.last_epoch
+    progress = current_step / total_steps
+    if progress > 0.8:
+        criterion.label_smoothing = 0.0
+        criterion.gamma = 0.0
+        # fold 1 정화 학습 메시지 (최초 1회 출력 권장이나 여기서는 매 에폭 첫 배치 전)
+    
     run_loss = run_pcs = total = correct = 0.0
     all_lbl, all_prob = [], []
     use_aug = (args.mixup_alpha > 0 or args.cutmix_alpha > 0)
@@ -523,7 +531,8 @@ def main():
 
                 tr_loss, tr_acc, tr_auc, pcs_reg = train_one_epoch(
                     model, train_loader, criterion, pcs_fn,
-                    optimizer, scheduler, device, args, use_sam=args.use_sam
+                    optimizer, scheduler, device, args, 
+                    total_steps=total_steps, use_sam=args.use_sam
                 )
                 v_loss, v_acc, v_auc, v_pcs, v_ece, v_probs, v_lbls = evaluate(
                     model, val_loader, criterion, device

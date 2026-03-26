@@ -277,8 +277,8 @@ class SAM(torch.optim.Optimizer):
 
 class FocalLoss(nn.Module):
     """Focal Loss + Label Smoothing.
-
-    gamma=2.0, label_smoothing=0.1 (v6 요구사항)
+    동적 Annealing 지원 (v6.1+):
+      OneCycleLR 진척도에 따라 label_smoothing=0.0, gamma=0.0 으로 선형 수렴 지원.
     """
 
     def __init__(
@@ -296,15 +296,29 @@ class FocalLoss(nn.Module):
             reduction="none", label_smoothing=label_smoothing
         )
 
+    @property
+    def label_smoothing(self):
+        return self._ce.label_smoothing
+
+    @label_smoothing.setter
+    def label_smoothing(self, value):
+        self._ce.label_smoothing = float(value)
+
     def forward(self, inputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
         if targets.ndim > 1:
             # Soft Label (Distillation) support
-            # targets shape: (B, C), inputs shape: (B, C)
             log_probs = F.log_softmax(inputs, dim=1)
             probs = torch.exp(log_probs)
             # Focal weight: (1-pt)^gamma
             pt = (probs * targets).sum(dim=1)
             focal_weight = (1.0 - pt) ** self.gamma
+            
+            # Label Smoothing for Soft Targets (KL-Divergence based implementation if needed)
+            # 여기서는 targets 가 이미 soft 이므로 LS 적용 시 targets 를 smoothing
+            if self.label_smoothing > 0:
+                num_classes = targets.size(1)
+                targets = targets * (1.0 - self.label_smoothing) + self.label_smoothing / num_classes
+            
             # Soft Cross Entropy
             loss = -(targets * log_probs).sum(dim=1) * focal_weight
         else:

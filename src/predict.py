@@ -189,10 +189,21 @@ def predict_with_model(
 
 
 def ensemble_mean(probs_list: list) -> np.ndarray:
-    """Calibrated Mean Ensemble.
-    LogLoss 방어: 극단값 클리핑 후 행 합계=1 재정규화.
+    """Calibrated Mean Ensemble with Probability Sharpening.
+    1) 평균 계산
+    2) [Probability Sharpening] Power Scaling (alpha=1.1) 적용 — LogLoss 최적화
+    3) [Re-normalization] axis=1 기준 합계 1 강제
+    4) [Clipping] Dacon 기준 1e-15 클리핑 방어
     """
     mean_p = np.mean(probs_list, axis=0)              # (N, 2)
+    
+    # [1. Probability Sharpener]
+    # 극단적인 확률값의 변동을 완화하면서도 정답에 대한 확신도를 정교하게 보정
+    alpha = 1.1
+    mean_p = np.power(mean_p, alpha)
+    mean_p = mean_p / mean_p.sum(axis=1, keepdims=True)
+    
+    # [2. Final Defense]
     mean_p = np.clip(mean_p, 1e-15, 1.0 - 1e-15)
     mean_p = mean_p / mean_p.sum(axis=1, keepdims=True)
     return mean_p

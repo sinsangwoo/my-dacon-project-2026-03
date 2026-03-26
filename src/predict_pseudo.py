@@ -33,7 +33,7 @@ def main():
         return
         
     print(f"📦 Loading checkpoint: {ckpt_path}")
-    ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     saved_args = ckpt.get("args", {})
     
     # 모델 생성 & 가중치 로드
