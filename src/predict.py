@@ -129,6 +129,7 @@ def load_model(ckpt_path: str, device, override_img_size: int = None):
         stoch_depth_p=0.0,   # 추론 시 SD 완전 비활성
     ).to(device)
     model.load_state_dict(ckpt["model_state_dict"])
+    model = model.to(memory_format=torch.channels_last)
     model.eval()
 
     temperature = float(np.clip(ckpt.get("temperature", 1.0), 0.1, 3.0))

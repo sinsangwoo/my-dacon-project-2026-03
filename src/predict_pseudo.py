@@ -45,6 +45,7 @@ def main():
 
     ).to(device)
     model.load_state_dict(ckpt["model_state_dict"])
+    model = model.to(memory_format=torch.channels_last)
     model.eval()
     print("✅ Model loaded successfully")
 
@@ -82,9 +83,9 @@ def main():
         step_ids = []
         with torch.no_grad():
             for front, top, diff, sample_ids in test_loader:
-                front = front.to(device)
-                top = top.to(device)
-                diff = diff.to(device)
+                front = front.to(device, memory_format=torch.channels_last)
+                top   = top.to(device, memory_format=torch.channels_last)
+                diff  = diff.to(device, memory_format=torch.channels_last)
                 outputs = model(front, top, diff)
                 probs = torch.softmax(outputs, dim=1).cpu().numpy()  # (B, 2)
                 step_probs.append(probs)

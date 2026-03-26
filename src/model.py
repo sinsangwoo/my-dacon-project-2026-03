@@ -297,9 +297,21 @@ class FocalLoss(nn.Module):
         )
 
     def forward(self, inputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        ce   = self._ce(inputs, targets)
-        pt   = torch.exp(-ce)
-        loss = self.alpha * (1.0 - pt) ** self.gamma * ce
+        if targets.ndim > 1:
+            # Soft Label (Distillation) support
+            # targets shape: (B, C), inputs shape: (B, C)
+            log_probs = F.log_softmax(inputs, dim=1)
+            probs = torch.exp(log_probs)
+            # Focal weight: (1-pt)^gamma
+            pt = (probs * targets).sum(dim=1)
+            focal_weight = (1.0 - pt) ** self.gamma
+            # Soft Cross Entropy
+            loss = -(targets * log_probs).sum(dim=1) * focal_weight
+        else:
+            # Hard Label (Standard)
+            ce   = self._ce(inputs, targets)
+            pt   = torch.exp(-ce)
+            loss = self.alpha * (1.0 - pt) ** self.gamma * ce
         return loss.mean() if self.reduction == "mean" else loss.sum()
 
 

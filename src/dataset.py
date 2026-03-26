@@ -113,7 +113,17 @@ class KFoldStructuralDataset(Dataset):
 
         self.df     = fold_df
         self.ids    = fold_df["id"].tolist()
-        self.labels = [LABEL_MAP[l] for l in fold_df["label"].tolist()]
+        
+        # 라벨 처리 — soft label 인 경우 float 그대로, hard label 인 경우 int 변환
+        self.labels = []
+        for _, row in fold_df.iterrows():
+            if "unstable_prob" in row and not pd.isna(row["unstable_prob"]):
+                # Soft Label (Distillation target)
+                self.labels.append(float(row["unstable_prob"]))
+            else:
+                # Hard Label
+                self.labels.append(LABEL_MAP[row["label"]])
+
         self.splits = fold_df["split"].tolist()
 
         # transform 설정 — 외부에서 주입하거나 기본값 사용
@@ -182,7 +192,15 @@ class KFoldStructuralDataset(Dataset):
             self._get_diff_map(os.path.join(folder, "simulation.mp4")),
             use_geom_only=True,
         )
-        return front, top, diff, self.labels[idx]
+        # target 이 float 이면 soft label, int 이면 hard label
+        target = self.labels[idx]
+        if isinstance(target, (int, np.integer)):
+            target = torch.tensor(target, dtype=torch.long)
+        else:
+            # Distillation [stable_prob, unstable_prob]
+            target = torch.tensor([1.0 - target, target], dtype=torch.float)
+
+        return front, top, diff, target
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -281,21 +299,22 @@ def build_full_df(data_dir: str) -> pd.DataFrame:
 def load_pseudo_v2(
     data_dir: str, threshold: float = 0.01
 ) -> pd.DataFrame:
-    """pseudo_v2.csv 에서 확신도 높은 샘플만 반환."""
+    """pseudo_v2.csv 에서 확신도 높은 샘플을 soft label 과 함께 반환."""
     path = os.path.join(data_dir, "pseudo_v2.csv")
     if not os.path.exists(path):
-        return pd.DataFrame(columns=["id", "label", "split"])
+        return pd.DataFrame(columns=["id", "label", "split", "unstable_prob"])
     df = pd.read_csv(path)
     mask = (
         (df["unstable_prob"] < threshold) |
         (df["unstable_prob"] > 1.0 - threshold)
     )
     df = df[mask].copy()
+    # label 컬럼은 기존 호환성을 위해 유지 (hard label)
     df["label"] = df["unstable_prob"].apply(
         lambda p: "unstable" if p > 0.5 else "stable"
     )
     df["split"] = "test"
-    return df[["id", "label", "split"]].reset_index(drop=True)
+    return df[["id", "label", "split", "unstable_prob"]].reset_index(drop=True)
 
 
 # ──────────────────────────────────────────────────────────────────

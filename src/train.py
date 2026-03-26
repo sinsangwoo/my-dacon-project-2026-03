@@ -158,7 +158,7 @@ def cutmix(x1, x2, x3, y, alpha, dev):
 # ──────────────────────────────────────────────────────────────────
 
 def train_one_epoch(
-    model, loader, criterion, pcs_fn, optimizer,
+    model, loader, criterion, pcs_fn, optimizer, scheduler,
     device, args, use_sam: bool = False
 ):
     """1 에포크 학습.
@@ -173,8 +173,10 @@ def train_one_epoch(
 
     for front, top, diff, labels in loader:
         front, top, diff, labels = (
-            front.to(device), top.to(device),
-            diff.to(device),  labels.to(device)
+            front.to(device, memory_format=torch.channels_last), 
+            top.to(device, memory_format=torch.channels_last),
+            diff.to(device, memory_format=torch.channels_last),  
+            labels.to(device)
         )
 
         # ── CutMix / Mixup ──
@@ -217,6 +219,9 @@ def train_one_epoch(
             logits, loss, pcs_val = _forward_loss()
             loss.backward()
             optimizer.step()
+        
+        if scheduler is not None:
+            scheduler.step()
 
         bs = front.size(0)
         run_loss += loss.item() * bs
@@ -225,11 +230,15 @@ def train_one_epoch(
 
         probs = torch.softmax(logits.detach(), dim=1)[:, 1].cpu().numpy()
         _, pred = logits.max(1)
+        
+        # metrics 용 hard conversion
+        hard_labels = labels if labels.ndim == 1 else labels.max(1)[1]
+        
         correct += (
             lam*pred.eq(ya).sum().item() + (1-lam)*pred.eq(yb).sum().item()
-            if mixed else pred.eq(labels).sum().item()
+            if mixed else pred.eq(hard_labels).sum().item()
         )
-        all_lbl.extend(labels.cpu().numpy())
+        all_lbl.extend(hard_labels.cpu().numpy())
         all_prob.extend(probs)
 
     auc = roc_auc_score(all_lbl, all_prob) if len(set(all_lbl)) > 1 else 0.5
@@ -248,8 +257,10 @@ def evaluate(model, loader, criterion, device):
 
     for front, top, diff, labels in loader:
         front, top, diff, labels = (
-            front.to(device), top.to(device),
-            diff.to(device),  labels.to(device)
+            front.to(device, memory_format=torch.channels_last), 
+            top.to(device, memory_format=torch.channels_last),
+            diff.to(device, memory_format=torch.channels_last),  
+            labels.to(device)
         )
         logits = model(front, top, diff)
         loss   = criterion(logits, labels)
@@ -286,7 +297,11 @@ def predict_loader(model, loader, device):
     model.eval()
     all_ids, all_probs = [], []
     for front, top, diff, ids in loader:
-        out   = model(front.to(device), top.to(device), diff.to(device))
+        out   = model(
+            front.to(device, memory_format=torch.channels_last), 
+            top.to(device, memory_format=torch.channels_last), 
+            diff.to(device, memory_format=torch.channels_last)
+        )
         probs = torch.softmax(out, dim=1).cpu().numpy()
         all_probs.append(probs)
         all_ids.extend(ids)
@@ -414,11 +429,11 @@ def main():
         )
         train_loader = DataLoader(
             train_ds, args.batch_size, shuffle=True,
-            num_workers=args.num_workers, pin_memory=True
+            num_workers=args.num_workers, pin_memory=(device.type == 'cuda')
         )
         val_loader = DataLoader(
             val_ds, args.batch_size, shuffle=False,
-            num_workers=args.num_workers, pin_memory=True
+            num_workers=args.num_workers, pin_memory=(device.type == 'cuda')
         )
 
         # ── Model ──
@@ -428,6 +443,9 @@ def main():
             dropout=args.dropout,
             stoch_depth_p=args.stoch_depth_p,
         ).to(device)
+        
+        # Performance Upgrade: NHWC (Channels Last) — CPU/CUDA 모두 지원
+        model = model.to(memory_format=torch.channels_last)
         print(f"   Params: {count_parameters(model):,}")
 
         criterion = FocalLoss(
@@ -451,8 +469,16 @@ def main():
             optimizer = base_opt
             print("   Optimizer: AdamW")
 
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-            base_opt, T_0=10, T_mult=1, eta_min=1e-6
+        # ── OneCycleLR Scheduler ──────────────────────────────────
+        # iterations 단위로 업데이트
+        total_steps = len(train_loader) * args.epochs
+        scheduler = torch.optim.lr_scheduler.OneCycleLR(
+            base_opt, max_lr=args.lr,
+            total_steps=total_steps,
+            pct_start=0.1,
+            div_factor=25,
+            final_div_factor=1000,
+            anneal_strategy='cos'
         )
 
         # ── SWA 모델 준비 ──
@@ -482,12 +508,11 @@ def main():
 
                 tr_loss, tr_acc, tr_auc, pcs_reg = train_one_epoch(
                     model, train_loader, criterion, pcs_fn,
-                    optimizer, device, args, use_sam=args.use_sam
+                    optimizer, scheduler, device, args, use_sam=args.use_sam
                 )
                 v_loss, v_acc, v_auc, v_pcs, v_ece, v_probs, v_lbls = evaluate(
                     model, val_loader, criterion, device
                 )
-                scheduler.step(epoch - 1)
 
                 # SWA 가중치 수집
                 if swa_model is not None and epoch >= swa_start:

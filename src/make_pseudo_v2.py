@@ -72,13 +72,18 @@ def main():
 
         ).to(device)
         model.load_state_dict(ckpt["model_state_dict"])
+        model = model.to(memory_format=torch.channels_last)
         model.eval()
         print(f"  ✅ Fold {fold_idx} loaded (epoch={ckpt['epoch']})")
 
         step_ids, step_probs = [], []
         with torch.no_grad():
             for front, top, diff, ids in test_loader:
-                out   = model(front.to(device), top.to(device), diff.to(device))
+                out   = model(
+                    front.to(device, memory_format=torch.channels_last), 
+                    top.to(device, memory_format=torch.channels_last), 
+                    diff.to(device, memory_format=torch.channels_last)
+                )
                 probs = torch.softmax(out, dim=1).cpu().numpy()
                 step_probs.append(probs)
                 if loaded == 0:
