@@ -114,6 +114,8 @@ def parse_args():
     p.add_argument("--report_file", default="report.md")
     p.add_argument("--seed",        type=int,   default=42)
     p.add_argument("--patience",    type=int,   default=7)
+    p.add_argument("--model_v",     type=str,   default="v6.3_0.1_pursuit",
+                   help="Model version string for reporting/logging.")
 
     return p.parse_args()
 
@@ -397,7 +399,7 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("\n" + "="*72)
-    print(f"🚀  Structural Stability Model v6.3 — 0.1% Pursuit")
+    print(f"🚀  Structural Stability Model {args.model_v}")
     print("="*72)
     print(f"🖥️  Device       : {device}")
     print(f"⚡ Memory Layout : Channels Last (NHWC) Optimized")
