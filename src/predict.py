@@ -132,7 +132,9 @@ def load_model(ckpt_path: str, device, override_img_size: int = None):
     model = model.to(memory_format=torch.channels_last)
     model.eval()
 
-    temperature = float(np.clip(ckpt.get("temperature", 1.0), 0.1, 3.0))
+    # [Golden Combination] Sensitivity Analysis (v6.2)
+    # alpha=1.20, T=0.5 (Minimal Val LogLoss: 0.157)
+    temperature = 0.5
 
     print(
         f"     img_size={img_size_used}  "
@@ -198,8 +200,8 @@ def ensemble_mean(probs_list: list) -> np.ndarray:
     mean_p = np.mean(probs_list, axis=0)              # (N, 2)
     
     # [1. Probability Sharpener]
-    # 극단적인 확률값의 변동을 완화하면서도 정답에 대한 확신도를 정교하게 보정
-    alpha = 1.1
+    # [Golden Combination] alpha=1.20
+    alpha = 1.20
     mean_p = np.power(mean_p, alpha)
     mean_p = mean_p / mean_p.sum(axis=1, keepdims=True)
     

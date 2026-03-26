@@ -180,10 +180,13 @@ def train_one_epoch(
     # [v6.1] Loss Annealing: Progress > 80% 시점에 LS=0, Gamma=0 (Pure CrossEntropy)
     current_step = scheduler.last_epoch
     progress = current_step / total_steps
+    phase = "BASE"
     if progress > 0.8:
+        if criterion.label_smoothing > 0 or criterion.gamma > 0:
+            print(f"\n   ✨ [Phase: LogLoss Purification] Switching to Pure CrossEntropy (Annealing Progress: {progress:.1%})")
         criterion.label_smoothing = 0.0
         criterion.gamma = 0.0
-        # fold 1 정화 학습 메시지 (최초 1회 출력 권장이나 여기서는 매 에폭 첫 배치 전)
+        phase = "PURE"
     
     run_loss = run_pcs = total = correct = 0.0
     all_lbl, all_prob = [], []
@@ -265,7 +268,7 @@ def train_one_epoch(
         all_prob.extend(probs)
 
     auc = roc_auc_score(all_lbl, all_prob) if len(set(all_lbl)) > 1 else 0.5
-    return run_loss/total, 100*correct/total, auc, run_pcs/total
+    return run_loss/total, 100*correct/total, auc, run_pcs/total, phase
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -393,12 +396,17 @@ def main():
     set_seed(args.seed)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"🖥️  Device      : {device}")
-    print(f"📐 img_size     : {args.img_size}")
-    print(f"⚙️  SAM         : {args.use_sam}  (ρ={args.sam_rho})")
-    print(f"📦 SWA epochs   : {args.swa_epochs}")
-    print(f"🎯 FocalLoss    : γ={args.focal_gamma}  ls={args.label_smoothing}")
-    print(f"💧 StochDepth   : {args.stoch_depth_p}")
+    print("\n" + "="*72)
+    print(f"🚀  Structural Stability Model v6.3 — 0.1% Pursuit")
+    print("="*72)
+    print(f"🖥️  Device       : {device}")
+    print(f"⚡ Memory Layout : Channels Last (NHWC) Optimized")
+    print(f"📐 img_size      : {args.img_size}")
+    print(f"⚙️  SAM          : {args.use_sam}  (ρ={args.sam_rho})")
+    print(f"📦 SWA epochs    : {args.swa_epochs}")
+    print(f"🎯 FocalLoss     : γ={args.focal_gamma}  ls={args.label_smoothing}")
+    print(f"💧 StochDepth    : {args.stoch_depth_p}")
+    print("="*72)
 
     os.makedirs(args.save_dir, exist_ok=True)
 
@@ -519,7 +527,7 @@ def main():
         epochs_no_improve = 0
         history           = []
 
-        hdr = (f"{'Ep':>3} | {'TrLoss':>7} | {'PCSRG':>6} | "
+        hdr = (f"{'Ep':>3} | {'Phase':>5} | {'TrLoss':>7} | "
                f"{'TrAUC':>6} | {'VLoss':>7} | {'VAUC':>6} | "
                f"{'PCS':>6} | {'ECE':>6} | {'Score':>7} | Time")
         print(hdr)
@@ -529,7 +537,7 @@ def main():
             for epoch in range(1, args.epochs + 1):
                 t0 = time.time()
 
-                tr_loss, tr_acc, tr_auc, pcs_reg = train_one_epoch(
+                tr_loss, tr_acc, tr_auc, pcs_reg, phase = train_one_epoch(
                     model, train_loader, criterion, pcs_fn,
                     optimizer, scheduler, device, args, 
                     total_steps=total_steps, use_sam=args.use_sam
@@ -546,7 +554,7 @@ def main():
                 elapsed = time.time() - t0
 
                 print(
-                    f"{epoch:3d} | {tr_loss:7.4f} | {pcs_reg:6.4f} | "
+                    f"{epoch:3d} | {phase:5s} | {tr_loss:7.4f} | "
                     f"{tr_auc:6.4f} | {v_loss:7.4f} | {v_auc:6.4f} | "
                     f"{v_pcs:6.4f} | {v_ece:6.4f} | {score:7.4f} | {elapsed:.1f}s"
                 )
