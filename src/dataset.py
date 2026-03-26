@@ -1,10 +1,28 @@
 """
-Dacon 구조 안정성 분류 — Dataset (v6)
+Dacon 구조 안정성 분류 — Dataset (v7)
 =======================================
-변경점:
-  - img_size 기본값 240 (EfficientNet-B1 네이티브 해상도)
-  - 나머지 구조 유지 (KFoldStructuralDataset, StructuralDataset,
-    build_full_df, load_pseudo_v2, transforms)
+수정 사항 (v6 → v7):
+  [#4] StructuralDataset.__getitem__ 에서 diff 스트림에 대한
+       물리적으로 부적절한 ColorJitter 적용 문제 해소.
+
+       diff = |last_frame - first_frame| 은 동역학 신호(모션 맵)이므로
+       색상/밝기 왜곡(ColorJitter, GaussianBlur 등)을 가하면
+       물리적 신호가 오염됨.
+
+       해결:
+         KFoldStructuralDataset / StructuralDataset 모두
+         __getitem__에서 transform을 split 처리:
+           - front/top  : self.transform 전체 적용 (기하학 + 색상)
+           - diff       : self.transform_geom_only 적용
+                          (Resize + 기하학 변환 + ToTensor + Normalize만)
+
+         transform 교체(TTA)는 self.transform 만 외부에서 바꾸면 됨.
+         transform_geom_only 는 transform에서 ColorJitter/GaussianBlur/
+         RandomGrayscale/RandomErasing 을 자동 제거하여 생성.
+
+  부수 수정:
+       - img_size 기본값을 224로 통일 (train.py 기본값과 일치)
+       - dataset.py 독스트링 업데이트
 """
 
 import os
@@ -22,6 +40,41 @@ from torchvision import transforms
 LABEL_MAP     = {"stable": 0, "unstable": 1}
 LABEL_MAP_INV = {v: k for k, v in LABEL_MAP.items()}
 
+# ColorJitter 등 색상 관련 transform 타입 목록 — diff 스트림에서 제거 대상
+_COLOR_TRANSFORM_TYPES = (
+    transforms.ColorJitter,
+    transforms.RandomGrayscale,
+    transforms.GaussianBlur,
+    transforms.RandomErasing,
+)
+
+
+def _make_geom_only_transform(tf) -> transforms.Compose:
+    """Compose 객체에서 색상 관련 변환만 제거해 기하학 전용 Compose 반환.
+
+    diff 스트림(동역학 모션 맵)은 기하학 변환(HFlip, Rotation, Affine)은
+    허용하되 색상 왜곡(ColorJitter, Blur 등)은 물리적으로 부적절하므로 제거.
+
+    Args:
+        tf: transforms.Compose 또는 단일 transform
+    Returns:
+        색상 변환이 제거된 transforms.Compose
+    """
+    if isinstance(tf, transforms.Compose):
+        filtered = [
+            t for t in tf.transforms
+            if not isinstance(t, _COLOR_TRANSFORM_TYPES)
+        ]
+        return transforms.Compose(filtered)
+    # 단일 transform인 경우
+    if isinstance(tf, _COLOR_TRANSFORM_TYPES):
+        # 색상 transform 자체인 경우 — Identity로 대체
+        return transforms.Compose([transforms.ToTensor(),
+                                    transforms.Normalize(
+                                        mean=[0.485, 0.456, 0.406],
+                                        std =[0.229, 0.224, 0.225])])
+    return tf
+
 
 # ──────────────────────────────────────────────────────────────────
 #  KFoldStructuralDataset
@@ -32,17 +85,19 @@ class KFoldStructuralDataset(Dataset):
 
     train.csv + dev.csv 를 통합한 full_df 에서
     fold_indices 로 슬라이싱. pseudo_df 는 train fold 에만 병합.
+
+    diff 스트림은 기하학 변환만 적용 (ColorJitter 등 색상 변환 제외).
     """
 
     def __init__(
         self,
-        data_dir:    str,
-        fold_indices: list,
-        all_df:      pd.DataFrame,
-        is_train:    bool = True,
+        data_dir:     str,
+        fold_indices:  list,
+        all_df:        pd.DataFrame,
+        is_train:      bool = True,
         transform=None,
-        img_size:    int  = 240,
-        pseudo_df:   pd.DataFrame = None,
+        img_size:      int  = 224,
+        pseudo_df:     pd.DataFrame = None,
     ):
         super().__init__()
         self.data_dir = data_dir
@@ -50,18 +105,31 @@ class KFoldStructuralDataset(Dataset):
 
         fold_df = all_df.iloc[fold_indices].copy().reset_index(drop=True)
         if is_train and pseudo_df is not None and len(pseudo_df) > 0:
-            # Leakage Check: all_df (train+dev) 에 이미 존재하는 ID 가 pseudo_df 에 있으면 제외
             existing_ids = set(all_df["id"])
             p_df = pseudo_df[~pseudo_df["id"].isin(existing_ids)].copy()
             if len(p_df) < len(pseudo_df):
-                 print(f"   ⚠️  Filtered {len(pseudo_df) - len(p_df)} overlapping IDs from pseudo_df")
+                print(f"   ⚠️  Filtered {len(pseudo_df) - len(p_df)} overlapping IDs from pseudo_df")
             fold_df = pd.concat([fold_df, p_df], ignore_index=True)
 
         self.df     = fold_df
         self.ids    = fold_df["id"].tolist()
         self.labels = [LABEL_MAP[l] for l in fold_df["label"].tolist()]
         self.splits = fold_df["split"].tolist()
+
+        # transform 설정 — 외부에서 주입하거나 기본값 사용
         self.transform = transform if transform is not None else get_val_transform(img_size)
+        # [#4 수정] diff 전용 기하학 transform 자동 생성
+        self.transform_geom_only = _make_geom_only_transform(self.transform)
+
+    # transform 교체 시 transform_geom_only 도 자동 동기화
+    def _set_transform(self, tf):
+        self._transform = tf
+        self.transform_geom_only = _make_geom_only_transform(tf)
+
+    def _get_transform(self):
+        return self._transform
+
+    transform = property(_get_transform, _set_transform)
 
     def __len__(self):
         return len(self.ids)
@@ -98,14 +166,22 @@ class KFoldStructuralDataset(Dataset):
         folder = os.path.join(self._img_root(idx), sid)
         seed   = np.random.randint(2_147_483_647)
 
-        def _apply(img):
+        def _apply(img, use_geom_only: bool = False):
+            """세 스트림 모두 동일 seed로 기하학 변환을 동기화.
+            diff 스트림은 use_geom_only=True 로 색상 변환 제거.
+            """
+            tf = self.transform_geom_only if use_geom_only else self.transform
             random.seed(seed)
             torch.manual_seed(seed)
-            return self.transform(img)
+            return tf(img)
 
         front = _apply(Image.open(os.path.join(folder, "front.png")).convert("RGB"))
         top   = _apply(Image.open(os.path.join(folder, "top.png")).convert("RGB"))
-        diff  = _apply(self._get_diff_map(os.path.join(folder, "simulation.mp4")))
+        # [#4 수정] diff는 기하학 변환만 — 색상 왜곡 없음
+        diff  = _apply(
+            self._get_diff_map(os.path.join(folder, "simulation.mp4")),
+            use_geom_only=True,
+        )
         return front, top, diff, self.labels[idx]
 
 
@@ -114,19 +190,33 @@ class KFoldStructuralDataset(Dataset):
 # ──────────────────────────────────────────────────────────────────
 
 class StructuralDataset(Dataset):
-    """test 데이터 예측 전용."""
+    """test 데이터 예측 전용.
 
-    def __init__(self, data_dir, split="test", transform=None, img_size=240):
+    diff 스트림은 기하학 변환만 적용 (KFoldStructuralDataset 와 동일 정책).
+    """
+
+    def __init__(self, data_dir, split="test", transform=None, img_size=224):
         super().__init__()
         self.data_dir = data_dir
         self.img_size = img_size
         if split != "test":
             raise ValueError("StructuralDataset 은 'test' split 만 지원합니다.")
-        self.df        = pd.read_csv(
-            os.path.join(data_dir, "sample_submission.csv")
-        )
-        self.ids       = self.df["id"].tolist()
+        self.df  = pd.read_csv(os.path.join(data_dir, "sample_submission.csv"))
+        self.ids = self.df["id"].tolist()
+
         self.transform = transform if transform is not None else get_val_transform(img_size)
+        # [#4 수정] diff 전용 기하학 transform 자동 생성
+        self.transform_geom_only = _make_geom_only_transform(self.transform)
+
+    # transform 교체 시 transform_geom_only 도 자동 동기화
+    def _set_transform(self, tf):
+        self._transform = tf
+        self.transform_geom_only = _make_geom_only_transform(tf)
+
+    def _get_transform(self):
+        return self._transform
+
+    transform = property(_get_transform, _set_transform)
 
     def __len__(self):
         return len(self.ids)
@@ -159,14 +249,19 @@ class StructuralDataset(Dataset):
         folder = os.path.join(self.data_dir, "test", sid)
         seed   = np.random.randint(2_147_483_647)
 
-        def _apply(img):
+        def _apply(img, use_geom_only: bool = False):
+            tf = self.transform_geom_only if use_geom_only else self.transform
             random.seed(seed)
             torch.manual_seed(seed)
-            return self.transform(img)
+            return tf(img)
 
         front = _apply(Image.open(os.path.join(folder, "front.png")).convert("RGB"))
         top   = _apply(Image.open(os.path.join(folder, "top.png")).convert("RGB"))
-        diff  = _apply(self._get_diff_map(os.path.join(folder, "simulation.mp4")))
+        # [#4 수정] diff는 기하학 변환만
+        diff  = _apply(
+            self._get_diff_map(os.path.join(folder, "simulation.mp4")),
+            use_geom_only=True,
+        )
         return front, top, diff, sid
 
 
@@ -191,9 +286,11 @@ def load_pseudo_v2(
     if not os.path.exists(path):
         return pd.DataFrame(columns=["id", "label", "split"])
     df = pd.read_csv(path)
-    mask = (df["unstable_prob"] < threshold) | \
-           (df["unstable_prob"] > 1.0 - threshold)
-    df   = df[mask].copy()
+    mask = (
+        (df["unstable_prob"] < threshold) |
+        (df["unstable_prob"] > 1.0 - threshold)
+    )
+    df = df[mask].copy()
     df["label"] = df["unstable_prob"].apply(
         lambda p: "unstable" if p > 0.5 else "stable"
     )
@@ -202,10 +299,11 @@ def load_pseudo_v2(
 
 
 # ──────────────────────────────────────────────────────────────────
-#  Transforms  (EfficientNet-B1: 240 기본)
+#  Transforms
+#  img_size 기본값: 224 (train.py 기본값과 통일)
 # ──────────────────────────────────────────────────────────────────
 
-def get_train_transform(img_size: int = 240):
+def get_train_transform(img_size: int = 224):
     """Physics-Aware 학습 증강."""
     return transforms.Compose([
         transforms.Resize((img_size, img_size)),
@@ -222,19 +320,19 @@ def get_train_transform(img_size: int = 240):
         transforms.ToTensor(),
         transforms.Normalize(
             mean=[0.485, 0.456, 0.406],
-            std =[0.229, 0.224, 0.225]
+            std =[0.229, 0.224, 0.225],
         ),
         transforms.RandomErasing(p=0.1, scale=(0.02, 0.1)),
     ])
 
 
-def get_val_transform(img_size: int = 240):
-    """검증/테스트용."""
+def get_val_transform(img_size: int = 224):
+    """검증/테스트용 (augmentation 없음)."""
     return transforms.Compose([
         transforms.Resize((img_size, img_size)),
         transforms.ToTensor(),
         transforms.Normalize(
             mean=[0.485, 0.456, 0.406],
-            std =[0.229, 0.224, 0.225]
+            std =[0.229, 0.224, 0.225],
         ),
     ])
