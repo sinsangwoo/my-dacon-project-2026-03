@@ -628,8 +628,8 @@ def main():
         """Calibrated Mean Ensemble — LogLoss 에 더 적합함.
         """
         mean_probs = np.mean(probs_list, axis=0)
-        # LogLoss 방어: 극단적인 확률값 클리핑 (1e-6 ~ 1-1e-6)
-        mean_probs = np.clip(mean_probs, 1e-6, 1.0 - 1e-6)
+        # LogLoss 방어: 극단적인 확률값 클리핑 (1e-15 ~ 1-1e-15)
+        mean_probs = np.clip(mean_probs, 1e-15, 1.0 - 1e-15)
         # 합계 1로 재정규화
         mean_probs = mean_probs / mean_probs.sum(axis=1, keepdims=True)
         return mean_probs

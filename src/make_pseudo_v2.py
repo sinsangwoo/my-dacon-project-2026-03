@@ -23,7 +23,7 @@ warnings.filterwarnings("ignore", category=UserWarning)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.dataset import StructuralDataset, get_val_transform
-from src.model import TripleStreamConvNeXt
+from src.model import TripleStreamEfficientNet
 
 
 def parse_args():
@@ -31,7 +31,7 @@ def parse_args():
     p.add_argument("--data_dir",   default="data")
     p.add_argument("--save_dir",   default="checkpoints")
     p.add_argument("--output",     default="data/pseudo_v2.csv")
-    p.add_argument("--img_size",   type=int,   default=268)
+    p.add_argument("--img_size",   type=int,   default=224)
     p.add_argument("--batch_size", type=int,   default=16)
     p.add_argument("--n_folds",    type=int,   default=5)
     p.add_argument("--threshold",  type=float, default=0.01,
@@ -65,9 +65,11 @@ def main():
 
         ckpt  = torch.load(ckpt_path, map_location=device, weights_only=False)
         sa    = ckpt.get("args", {})
-        model = TripleStreamConvNeXt(
+        model = TripleStreamEfficientNet(
             num_classes=2, pretrained=False,
-            dropout=sa.get("dropout", 0.3),
+            dropout=sa.get("dropout", 0.4),
+            stoch_depth_p=0.0,
+
         ).to(device)
         model.load_state_dict(ckpt["model_state_dict"])
         model.eval()

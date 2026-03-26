@@ -15,7 +15,7 @@ warnings.filterwarnings("ignore", category=UserWarning)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.dataset import StructuralDataset, get_val_transform
-from src.model import TripleStreamConvNeXt
+from src.model import TripleStreamEfficientNet
 
 def main():
     data_dir = "data"
@@ -37,10 +37,12 @@ def main():
     saved_args = ckpt.get("args", {})
     
     # 모델 생성 & 가중치 로드
-    model = TripleStreamConvNeXt(
+    model = TripleStreamEfficientNet(
         num_classes=2,
         pretrained=False,
-        dropout=saved_args.get("dropout", 0.3),
+        dropout=saved_args.get("dropout", 0.4),
+        stoch_depth_p=0.0,
+
     ).to(device)
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval()

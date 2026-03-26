@@ -192,7 +192,7 @@ def ensemble_mean(probs_list: list) -> np.ndarray:
     LogLoss 방어: 극단값 클리핑 후 행 합계=1 재정규화.
     """
     mean_p = np.mean(probs_list, axis=0)              # (N, 2)
-    mean_p = np.clip(mean_p, 1e-7, 1.0 - 1e-7)
+    mean_p = np.clip(mean_p, 1e-15, 1.0 - 1e-15)
     mean_p = mean_p / mean_p.sum(axis=1, keepdims=True)
     return mean_p
 
