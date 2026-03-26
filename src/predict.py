@@ -68,6 +68,7 @@ def load_model(ckpt_path, device):
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
     temperature = ckpt.get("temperature", 1.0)
+    temperature = np.clip(temperature, 0.1, 3.0)
     return model, temperature, ckpt.get("epoch", "?"), ckpt.get("dev_ece", float("nan"))
 
 
@@ -101,15 +102,16 @@ def predict_with_model(model, dataset, batch_size, device, tta_tfs, temperature=
     return all_ids, sum_probs / len(tta_tfs)
 
 
-def rank_avg(probs_list):
-    """Rank Averaging — 확률을 순위로 변환 후 평균 → LogLoss 폭탄 방어."""
-    N        = probs_list[0].shape[0]
-    rank_sum = np.zeros(N)
-    for probs in probs_list:
-        order     = np.argsort(np.argsort(probs[:, 1]))
-        rank_sum += (order + 1)
-    norm = rank_sum / len(probs_list) / N
-    return np.stack([1 - norm, norm], axis=1)
+def ensemble_mean(probs_list):
+    """Calibrated Mean Ensemble — LogLoss 에 더 적합함.
+    Rank Averaging 은 LogLoss 에서 불리하므로 제거.
+    """
+    mean_probs = np.mean(probs_list, axis=0)
+    # LogLoss 방어: 극단적인 확률값 클리핑 (1e-6 ~ 1-1e-6)
+    mean_probs = np.clip(mean_probs, 1e-6, 1.0 - 1e-6)
+    # 합계 1로 재정규화
+    mean_probs = mean_probs / mean_probs.sum(axis=1, keepdims=True)
+    return mean_probs
 
 
 def main():
@@ -162,14 +164,19 @@ def main():
     if not all_probs_list:
         raise RuntimeError("유효한 checkpoint 가 없습니다. train.py 를 먼저 실행하세요.")
 
-    print(f"\n🗳️  Rank Averaging {len(all_probs_list)} predictions...")
-    ensemble_probs = rank_avg(all_probs_list)
+    print(f"\n🗳️  Ensemble Mean of {len(all_probs_list)} predictions...")
+    ensemble_probs = ensemble_mean(all_probs_list)
 
     submission = pd.DataFrame({
         "id":            final_ids,
         "unstable_prob": ensemble_probs[:, 1],
         "stable_prob":   ensemble_probs[:, 0],
     })
+
+    # 원본 sample_submission.csv 순서와 100% 일치하도록 정렬 강제
+    sample_sub = pd.read_csv(os.path.join(args.data_dir, "sample_submission.csv"))
+    submission = submission.set_index("id").reindex(sample_sub["id"]).reset_index()
+
     submission.to_csv(args.output_csv, index=False)
     print(f"💾 Submission: {args.output_csv}")
 

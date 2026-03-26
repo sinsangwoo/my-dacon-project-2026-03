@@ -50,7 +50,12 @@ class KFoldStructuralDataset(Dataset):
 
         fold_df = all_df.iloc[fold_indices].copy().reset_index(drop=True)
         if is_train and pseudo_df is not None and len(pseudo_df) > 0:
-            fold_df = pd.concat([fold_df, pseudo_df], ignore_index=True)
+            # Leakage Check: all_df (train+dev) 에 이미 존재하는 ID 가 pseudo_df 에 있으면 제외
+            existing_ids = set(all_df["id"])
+            p_df = pseudo_df[~pseudo_df["id"].isin(existing_ids)].copy()
+            if len(p_df) < len(pseudo_df):
+                 print(f"   ⚠️  Filtered {len(pseudo_df) - len(p_df)} overlapping IDs from pseudo_df")
+            fold_df = pd.concat([fold_df, p_df], ignore_index=True)
 
         self.df     = fold_df
         self.ids    = fold_df["id"].tolist()

@@ -64,10 +64,9 @@ def parse_args():
         description="Structural Stability — Triple-Stream EfficientNet-B1 v6"
     )
     # 데이터
-    p.add_argument("--data_dir",      default="data")
-    p.add_argument("--img_size",      type=int,   default=240,
-                   help="EfficientNet-B1 기본 입력 240 (그 이상도 가능)")
-    p.add_argument("--num_workers",   type=int,   default=0)
+    p.add_argument("--img_size",      type=int,   default=224,
+                   help="EfficientNet-B1 추천 규격 224 (속도 최적화)")
+    p.add_argument("--num_workers",   type=int,   default=os.cpu_count() or 0)
     p.add_argument("--n_folds",       type=int,   default=5)
     p.add_argument("--use_pseudo_v2", action="store_true", default=False)
 
@@ -477,64 +476,67 @@ def main():
         print(hdr)
         print("-" * len(hdr))
 
-        for epoch in range(1, args.epochs + 1):
-            t0 = time.time()
+        try:
+            for epoch in range(1, args.epochs + 1):
+                t0 = time.time()
 
-            tr_loss, tr_acc, tr_auc, pcs_reg = train_one_epoch(
-                model, train_loader, criterion, pcs_fn,
-                optimizer, device, args, use_sam=args.use_sam
-            )
-            v_loss, v_acc, v_auc, v_pcs, v_ece, v_probs, v_lbls = evaluate(
-                model, val_loader, criterion, device
-            )
-            scheduler.step(epoch - 1)
-
-            # SWA 가중치 수집
-            if swa_model is not None and epoch >= swa_start:
-                swa_model.update_parameters(model)
-
-            score   = v_loss - PCS_BONUS * v_pcs
-            elapsed = time.time() - t0
-
-            print(
-                f"{epoch:3d} | {tr_loss:7.4f} | {pcs_reg:6.4f} | "
-                f"{tr_auc:6.4f} | {v_loss:7.4f} | {v_auc:6.4f} | "
-                f"{v_pcs:6.4f} | {v_ece:6.4f} | {score:7.4f} | {elapsed:.1f}s"
-            )
-
-            history.append(dict(
-                epoch=epoch, train_loss=tr_loss, pcs_reg=pcs_reg,
-                train_auc=tr_auc, dev_loss=v_loss, dev_auc=v_auc,
-                pcs=v_pcs, ece=v_ece,
-            ))
-
-            # best ECE 기준 저장
-            if score < best_score:
-                best_score        = score
-                best_loss_val     = v_loss
-                best_auc_val      = v_auc
-                best_pcs_val      = v_pcs
-                best_ece_val      = v_ece
-                best_epoch        = epoch
-                epochs_no_improve = 0
-                ckpt_path = os.path.join(
-                    args.save_dir, f"best_fold{fold_idx}.pth"
+                tr_loss, tr_acc, tr_auc, pcs_reg = train_one_epoch(
+                    model, train_loader, criterion, pcs_fn,
+                    optimizer, device, args, use_sam=args.use_sam
                 )
-                torch.save(dict(
-                    epoch=epoch,
-                    model_state_dict=model.state_dict(),
-                    dev_loss=v_loss, dev_auc=v_auc,
-                    dev_pcs=v_pcs,  dev_ece=v_ece,
-                    composite_score=score,
-                    args=vars(args),
-                ), ckpt_path)
-                print(f"  ✅ best  Loss={v_loss:.4f} AUC={v_auc:.4f} "
-                      f"PCS={v_pcs:.4f} ECE={v_ece:.4f}")
-            else:
-                epochs_no_improve += 1
-                if epochs_no_improve >= args.patience:
-                    print(f"  ⏹️  Early stop @ epoch {epoch}")
-                    break
+                v_loss, v_acc, v_auc, v_pcs, v_ece, v_probs, v_lbls = evaluate(
+                    model, val_loader, criterion, device
+                )
+                scheduler.step(epoch - 1)
+
+                # SWA 가중치 수집
+                if swa_model is not None and epoch >= swa_start:
+                    swa_model.update_parameters(model)
+
+                score   = v_loss - PCS_BONUS * v_pcs
+                elapsed = time.time() - t0
+
+                print(
+                    f"{epoch:3d} | {tr_loss:7.4f} | {pcs_reg:6.4f} | "
+                    f"{tr_auc:6.4f} | {v_loss:7.4f} | {v_auc:6.4f} | "
+                    f"{v_pcs:6.4f} | {v_ece:6.4f} | {score:7.4f} | {elapsed:.1f}s"
+                )
+
+                history.append(dict(
+                    epoch=epoch, train_loss=tr_loss, pcs_reg=pcs_reg,
+                    train_auc=tr_auc, dev_loss=v_loss, dev_auc=v_auc,
+                    pcs=v_pcs, ece=v_ece,
+                ))
+
+                # best ECE 기준 저장
+                if score < best_score:
+                    best_score        = score
+                    best_loss_val     = v_loss
+                    best_auc_val      = v_auc
+                    best_pcs_val      = v_pcs
+                    best_ece_val      = v_ece
+                    best_epoch        = epoch
+                    epochs_no_improve = 0
+                    ckpt_path = os.path.join(
+                        args.save_dir, f"best_fold{fold_idx}.pth"
+                    )
+                    torch.save(dict(
+                        epoch=epoch,
+                        model_state_dict=model.state_dict(),
+                        dev_loss=v_loss, dev_auc=v_auc,
+                        dev_pcs=v_pcs,  dev_ece=v_ece,
+                        composite_score=score,
+                        args=vars(args),
+                    ), ckpt_path)
+                    print(f"  ✅ best  Loss={v_loss:.4f} AUC={v_auc:.4f} "
+                          f"PCS={v_pcs:.4f} ECE={v_ece:.4f}")
+                else:
+                    epochs_no_improve += 1
+                    if epochs_no_improve >= args.patience:
+                        print(f"  ⏹️  Early stop @ epoch {epoch}")
+                        break
+        except KeyboardInterrupt:
+            print("\n  ⚠️  Training interrupted by user. Saving current SWA if available...")
 
         # ── SWA BN 업데이트 및 저장 ──────────────────────────────
         swa_ece = float("nan")
@@ -622,24 +624,15 @@ def main():
         )
 
     # ── Rank Averaging Ensemble ───────────────────────────────────
-    print("\n🗳️  Rank Averaging Ensemble...")
-
-    def rank_avg(probs_list):
-        """각 fold 예측을 확률 순위(rank)로 변환 후 평균.
-
-        - 확률 폭탄(극단값) 에 강건함
-        - LogLoss 분산을 줄여 순위 변동성 최소화
+    def ensemble_mean(probs_list):
+        """Calibrated Mean Ensemble — LogLoss 에 더 적합함.
         """
-        N = probs_list[0].shape[0]
-        rank_sum = np.zeros(N)
-        for probs in probs_list:
-            # unstable_prob 기준 순위 (1~N)
-            order = np.argsort(np.argsort(probs[:, 1]))  # 낮은 확률 → 낮은 rank
-            rank_sum += (order + 1)   # 1-indexed
-        rank_avg_vals = rank_sum / len(probs_list) / N   # 0~1 정규화
-        # stable_prob = 1 - unstable_prob
-        result = np.stack([1 - rank_avg_vals, rank_avg_vals], axis=1)
-        return result
+        mean_probs = np.mean(probs_list, axis=0)
+        # LogLoss 방어: 극단적인 확률값 클리핑 (1e-6 ~ 1-1e-6)
+        mean_probs = np.clip(mean_probs, 1e-6, 1.0 - 1e-6)
+        # 합계 1로 재정규화
+        mean_probs = mean_probs / mean_probs.sum(axis=1, keepdims=True)
+        return mean_probs
 
     # best-ECE + SWA 모두 합산
     all_probs_for_ensemble = fold_test_probs.copy()
@@ -649,13 +642,18 @@ def main():
               f"{len(fold_swa_probs)} SWA = "
               f"{len(all_probs_for_ensemble)} total")
 
-    ensemble_probs = rank_avg(all_probs_for_ensemble)
+    ensemble_probs = ensemble_mean(all_probs_for_ensemble)
 
     submission = pd.DataFrame({
         "id":            test_ids_ref,
         "unstable_prob": ensemble_probs[:, 1],
         "stable_prob":   ensemble_probs[:, 0],
     })
+
+    # 원본 sample_submission.csv 순서와 100% 일치하도록 정렬 강제
+    sample_sub = pd.read_csv(os.path.join(args.data_dir, "sample_submission.csv"))
+    submission = submission.set_index("id").reindex(sample_sub["id"]).reset_index()
+
     out_csv = os.path.join(os.getcwd(), "submission.csv")
     submission.to_csv(out_csv, index=False)
     print(f"💾 Submission saved: {out_csv}")
