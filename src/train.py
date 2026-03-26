@@ -69,6 +69,7 @@ def parse_args():
         description="Structural Stability — Triple-Stream EfficientNet-B1 v6"
     )
     # 데이터
+    p.add_argument("--data_dir",      default="data")
     p.add_argument("--img_size",      type=int,   default=224,
                    help="EfficientNet-B1 추천 규격 224 (속도 최적화)")
     p.add_argument("--num_workers",   type=int,   default=os.cpu_count() or 0)
@@ -116,6 +117,8 @@ def parse_args():
     p.add_argument("--patience",    type=int,   default=7)
     p.add_argument("--model_v",     type=str,   default="v6.3_0.1_pursuit",
                    help="Model version string for reporting/logging.")
+    p.add_argument("--fold_idx",    type=int,   default=None,
+                   help="Specific fold to train (1-based). If None, all folds are trained.")
 
     return p.parse_args()
 
@@ -445,6 +448,9 @@ def main():
     for fold_idx, (tr_idx, val_idx) in enumerate(
         skf.split(np.zeros(len(full_df)), labels_arr), start=1
     ):
+        if args.fold_idx is not None and fold_idx != args.fold_idx:
+            continue
+            
         print(f"\n{'='*72}")
         print(f"  FOLD {fold_idx}/{args.n_folds}  "
               f"train={len(tr_idx)}  val={len(val_idx)}")
