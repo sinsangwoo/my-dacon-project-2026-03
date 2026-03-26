@@ -9,6 +9,11 @@ Dacon 구조 안정성 분류 — 학습 스크립트 (v6)
   - 체크포인트 두 버전 저장: best ECE 기준 + SWA 적용
   - label_smoothing=0.1, focal_gamma=2.0
 
+패치 (v6 → v6.1):
+  [PATCH-1] cutmix(): in-place 수정 전 patch 영역을 clone()으로 먼저 추출
+  [PATCH-2] train_one_epoch(): mixed=True 덮어쓰기 버그 수정
+  [PATCH-3] Temperature Scaling torch.load(): weights_only=False 로 통일
+
 사용법:
     python src/train.py --data_dir data --epochs 30 --batch_size 16
     python src/train.py --use_sam               # SAM optimizer 활성
@@ -144,11 +149,16 @@ def mixup(x1, x2, x3, y, alpha, dev):
 
 
 def cutmix(x1, x2, x3, y, alpha, dev):
-    lam          = np.random.beta(alpha, alpha) if alpha > 0 else 1.0
-    idx          = torch.randperm(x1.size(0)).to(dev)
-    b1,b2,b3,b4  = rand_bbox(x1.size(), lam)
+    lam         = np.random.beta(alpha, alpha) if alpha > 0 else 1.0
+    idx         = torch.randperm(x1.size(0)).to(dev)
+    b1,b2,b3,b4 = rand_bbox(x1.size(), lam)
+    # [PATCH-1] in-place 수정 전에 교체할 영역을 clone()으로 먼저 추출.
+    #   수정 전: xk[idx,:,b1:b3,b2:b4] 를 읽을 때 xk가 이미 오염되어
+    #            idx[i]==i 인 원소에서 잘못된 값을 복사하는 통계 편향 발생.
+    #   수정 후: patch를 미리 clone하여 in-place 수정 이전 값만 사용.
     for xk in (x1, x2, x3):
-        xk[:,:,b1:b3,b2:b4] = xk[idx,:,b1:b3,b2:b4]
+        patch = xk[idx, :, b1:b3, b2:b4].clone()
+        xk[:, :, b1:b3, b2:b4] = patch
     lam = 1 - (b3-b1)*(b4-b2) / (x1.size(-1)*x1.size(-2))
     return x1, x2, x3, y, y[idx], lam
 
@@ -180,17 +190,22 @@ def train_one_epoch(
         )
 
         # ── CutMix / Mixup ──
+        # [PATCH-2] mixed=True 덮어쓰기 버그 수정.
+        #   수정 전: else 브랜치에서 mixed=False 를 세팅해도
+        #            블록 마지막의 mixed=True 가 항상 덮어써서
+        #            ya/yb 미정의 상태에서 mixed=True 가 되는 NameError 발생 가능.
+        #   수정 후: mixed=True 를 성공적 augmentation 분기 내부로 이동.
         mixed = False
         if use_aug and np.random.rand() < args.cutmix_prob:
             if np.random.rand() < 0.5 and args.mixup_alpha > 0:
                 front, top, diff, ya, yb, lam = mixup(
                     front, top, diff, labels, args.mixup_alpha, device)
+                mixed = True
             elif args.cutmix_alpha > 0:
                 front, top, diff, ya, yb, lam = cutmix(
                     front, top, diff, labels, args.cutmix_alpha, device)
-            else:
-                mixed = False
-            mixed = True
+                mixed = True
+            # else: 두 alpha 모두 0 이면 mixed=False 유지
 
         def _forward_loss():
             """logits 계산 + total loss 반환. SAM 양쪽 pass 공유."""
@@ -314,7 +329,7 @@ def predict_loader(model, loader, device):
 
 def generate_report(fold_results, report_path):
     with open(report_path, "w", encoding="utf-8") as f:
-        f.write("# Training Report (v6 — EfficientNet-B1 / SWA / SAM)\n\n")
+        f.write("# Training Report (v6.1 — EfficientNet-B1 / SWA / SAM)\n\n")
 
         f.write("## 1. Fold 요약\n")
         f.write("| Fold | Best Ep | Dev Loss | Dev AUC | PCS | ECE | T(temp) | SWA ECE |\n")
@@ -587,9 +602,12 @@ def main():
             print(f"   💾 SWA saved → {swa_path}  ECE={swa_ece:.4f}")
 
         # ── Temperature Scaling ───────────────────────────────────
+        # [PATCH-3] weights_only=False 로 통일 (predict.py 와 동일).
+        #   args=vars(args) 를 포함한 체크포인트는 PyTorch 2.x weights_only=True
+        #   모드에서 UnpicklingError 를 유발할 수 있어 폴드가 중단되는 문제 방지.
         ckpt = torch.load(
             os.path.join(args.save_dir, f"best_fold{fold_idx}.pth"),
-            map_location=device, weights_only=True
+            map_location=device, weights_only=False
         )
         model.load_state_dict(ckpt["model_state_dict"])
 
