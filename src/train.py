@@ -144,6 +144,20 @@ def rand_bbox(size, lam):
     )
 
 
+def update_bn_custom(loader, model, device=None):
+    """SWA BN 업데이트 커스텀 (TripleStream 대응).
+    
+    기존 update_bn은 model(x) 형태만 지원하지만, 우리 모델은 (front, top, diff)를 요구함.
+    """
+    model.train()
+    with torch.no_grad():
+        for front, top, diff, _ in loader:
+            front = front.to(device, memory_format=torch.channels_last)
+            top   = top.to(device, memory_format=torch.channels_last)
+            diff  = diff.to(device, memory_format=torch.channels_last)
+            model(front, top, diff)
+
+
 def mixup(x1, x2, x3, y, alpha, dev):
     lam = np.random.beta(alpha, alpha) if alpha > 0 else 1.0
     idx = torch.randperm(x1.size(0)).to(dev)
@@ -608,7 +622,7 @@ def main():
         if swa_model is not None:
             print("   📦 Updating SWA BatchNorm statistics...")
             try:
-                update_bn(train_loader, swa_model, device=device)
+                update_bn_custom(train_loader, swa_model, device=device)
             except Exception as e:
                 print(f"   ⚠️  update_bn failed: {e}")
 
