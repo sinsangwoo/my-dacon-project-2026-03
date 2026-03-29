@@ -8,3 +8,6 @@ __pycache__/
 *.pyc
 checkpoints/
 *.pth
+*.json
+*.log
+*.csv
