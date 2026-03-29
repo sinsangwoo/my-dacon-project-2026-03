@@ -84,7 +84,7 @@ def load_model(ckpt_path: str, device, override_img_size: int = None):
         pretrained=False,
         dropout=sa.get("dropout", 0.4),
     ).to(device)
-    model.load_state_dict(ckpt["model_state_dict"])
+    model.load_state_dict(ckpt["model_state_dict"], strict=False)
     model = model.to(memory_format=torch.channels_last)
     model.eval()
 
